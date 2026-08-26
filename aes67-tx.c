@@ -65,7 +65,7 @@
 #include <net/if.h>
 
 #define PROGRAM   "aes67-tx"
-#define VERSION   "1.2.0"
+#define VERSION   "1.2.1"
 
 /* POSIX clock number of a PTP hardware clock (PHC), as used by linuxptp.
  * It is the same magic value for every /dev/ptpN; the kernel resolves it to
@@ -379,7 +379,27 @@ int main(int argc, char **argv)
             out[2]=(seq>>8)&0xff; out[3]=seq&0xff;
             out[4]=(ts>>24)&0xff; out[5]=(ts>>16)&0xff; out[6]=(ts>>8)&0xff; out[7]=ts&0xff;
             out[8]=(ssrc>>24)&0xff; out[9]=(ssrc>>16)&0xff; out[10]=(ssrc>>8)&0xff; out[11]=ssrc&0xff;
-            memcpy(out+12, in, packet_bytes);
+            /* AES67 L16/L24 are big-endian; input PCM (from ffmpeg) is little-endian.
+             * Byte-swap each sample into the RTP payload. */
+            {
+                int spb = c.bitdepth / 8;               /* 2 (16-bit) or 3 (24-bit) */
+                int samples = c.pkt * c.channels;
+                uint8_t *dst = out + 12;
+                if (spb == 3) {
+                    for (int s = 0; s < samples; s++) {
+                        int off = s * 3;
+                        dst[off]   = in[off+2];
+                        dst[off+1] = in[off+1];
+                        dst[off+2] = in[off];
+                    }
+                } else {
+                    for (int s = 0; s < samples; s++) {
+                        int off = s * 2;
+                        dst[off]   = in[off+1];
+                        dst[off+1] = in[off];
+                    }
+                }
+            }
             sendto(tx, out, 12+packet_bytes, 0, (struct sockaddr *)&txa, sizeof txa);
             seq++; lastts=ts; pktcnt++; octet += packet_bytes; got = 0;
 

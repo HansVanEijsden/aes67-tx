@@ -1,22 +1,25 @@
-# Real-world example: publish a network FLAC/IceCast stream as a PTP-synced AES67 L16 source.
-# ffmpeg decodes the OGG/FLAC stream to raw PCM, aes67-tx --raw re-stamps it from the PTP
-# clock and emits AES67 on the Dante network. This is how "Salland1 HD Program" is fed
-# when the studio cannot yet send Dante/AS67 directly (e.g. no TailScale/Dante at the source).
+# Real-world example: publish a network FLAC/IceCast stream as a PTP-synced AES67 L24 source.
+# ffmpeg decodes the OGG/FLAC stream to raw PCM, scales the 16-bit content to 24-bit
+# (volume=48.1648dB = x256, so the level is preserved), and aes67-tx --raw re-stamps it from
+# the PTP clock and emits AES67 on the Dante network. This is how "Salland1 HD Program" is
+# fed when the studio cannot yet send Dante/AS67 directly (e.g. no TailScale/Dante at source).
+#
+# NOTE: a PCM24 receiver (like this Dante bridge) rejects L16 flows, so we output L24 and
+# scale the 16-bit source up (x256) to keep the correct level. The raw input path swaps
+# little-endian PCM to the big-endian L24 that AES67 requires.
 #
 # ffmpeg -reconnect keeps reconnecting over short outages; aes67-tx exits on upstream EOF so
-# systemd ("Restart=always") re-spawns the whole pipeline to rejoin. Together this gives
-# automatic reconnection on short and long internet drops.
+# systemd ("Restart=always") re-spawns the whole pipeline to rejoin. Automatic reconnection.
 #
-# NOTE: the source is 16-bit, so the AES67 output is L16 (rtpmap L16/48000/2).
 # Adjust the URL, -a/-p (output AES67 group/port) and -f (iface) as needed.
 [Unit]
-Description=aes67-tx - Salland1 HD Program (Salland1 FLAC to PTP-synced AES67)
+Description=aes67-tx - Salland1 HD Program (Salland1 FLAC to PTP-synced AES67 L24)
 After=network-online.target ptp4l-slave-eno1.service
 Wants=network-online.target
 
 [Service]
 Type=simple
-ExecStart=/bin/bash -c 'ffmpeg -hide_banner -loglevel error -reconnect 1 -reconnect_streamed 1 -reconnect_delay_max 5 -i "https://radio.salland1.nl/salland1-flac" -vn -f s16le -ar 48000 -ac 2 - | /usr/local/bin/aes67-tx --raw -a 239.69.100.2 -p 5004 -f eno1 -b 16 -C 2 -n 48 -v'
+ExecStart=/bin/bash -c 'ffmpeg -hide_banner -loglevel error -reconnect 1 -reconnect_streamed 1 -reconnect_delay_max 5 -i "https://radio.salland1.nl/salland1-flac" -vn -af "volume=48.1648dB" -f s24le -ar 48000 -ac 2 - | /usr/local/bin/aes67-tx --raw -a 239.69.100.2 -p 5004 -f eno1 -b 24 -C 2 -n 48 -v'
 Restart=always
 RestartSec=2
 

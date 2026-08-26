@@ -141,19 +141,23 @@ it as AES67, re-stamping every packet from the PTP clock. Combine it with a deco
 produces PCM at the session rate, e.g.:
 
 ```sh
+# 16-bit source -> scale to 24-bit (volume=48.1648dB = x256 so the level is preserved)
 ffmpeg -hide_banner -loglevel error -reconnect 1 -reconnect_streamed 1 -reconnect_delay_max 5 \
-  -i "https://example.org/station" -vn -f s16le -ar 48000 -ac 2 - \
-  | aes67-tx --raw -a 239.69.100.2 -p 5004 -f eth0 -b 16 -C 2 -n 48 -v
+  -i "https://example.org/station" -vn -af "volume=48.1648dB" -f s24le -ar 48000 -ac 2 - \
+  | aes67-tx --raw -a 239.69.100.2 -p 5004 -f eth0 -b 24 -C 2 -n 48 -v
 ```
 
 - `-b 16`/`-b 24` set the PCM width; the AES67 payload becomes `L16`/`L24` accordingly.
+- **AES67 L16/L24 are big-endian**; `aes67-tx --raw` byte-swaps the little-endian PCM it
+  reads (from ffmpeg) to the big-endian RTP payload automatically.
+- **A PCM24 receiver (many Dante bridges) rejects `L16` flows.** If your device is configured
+  for 24-bit, output `L24`. When the source is 16-bit, scale it up: `-af "volume=48.1648dB"`
+  (`×256`) keeps the level correct (without this the 16-bit content sits too quiet in a
+  24-bit container).
 - `-n 48` = 48 frames/packet (≈1 ms at 48 kHz). Keep the SDP's `a=ptime` in agreement.
 - `ffmpeg -reconnect ...` reconnects over short outages; `aes67-tx --raw` exits on upstream
   EOF so a supervising `systemd` unit (`Restart=always`) re-spawns the pipeline for longer
   drops — together this gives automatic reconnection.
-- The stream must decode to the session sample rate (here 48 kHz stereo). If the source is
-  16-bit, output `L16` (native level); if you prefer `L24`, resample with scaling so the
-  level is preserved.
 
 ### Output interface
 
@@ -258,12 +262,13 @@ simultaneously on one host, each on its own multicast group:
 
 - `examples/aes67-1zwolle-hd.service` — re-publishes a source AES67/RTP stream (a broadcast
   processor / LiveWire) as **L24** AES67 on `239.69.100.1`.
-- `examples/aes67-salland1-hd.service` — decodes a network IceCast/FLAC stream with ffmpeg
-  and publishes it as **L16** AES67 on `239.69.100.2` (handy when the studio can't yet send
-  AES67/Dante directly), with automatic reconnection on internet drops.
+- `examples/aes67-salland1-hd.service` — decodes a network IceCast/FLAC stream with ffmpeg,
+  scales the 16-bit source to 24-bit and publishes it as **L24** AES67 on `239.69.100.2`
+  (handy when the studio can't yet send AES67/Dante directly), with automatic reconnection on
+  internet drops.
 
 Each channel uses its own output group and its own SDP: `example-sdp.txt` (L24) and
-`example-sdp-l16.txt` (L16). Install and start them with:
+`example-sdp-salland1.txt` (L24, from a 16-bit source). Install and start them with:
 
 ```sh
 sudo cp examples/*.service /etc/systemd/system/
