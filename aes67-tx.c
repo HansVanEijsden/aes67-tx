@@ -65,7 +65,7 @@
 #include <net/if.h>
 
 #define PROGRAM   "aes67-tx"
-#define VERSION   "1.2.1"
+#define VERSION   "1.2.2"
 
 /* POSIX clock number of a PTP hardware clock (PHC), as used by linuxptp.
  * It is the same magic value for every /dev/ptpN; the kernel resolves it to
@@ -353,6 +353,12 @@ int main(int argc, char **argv)
         int bytes_per_frame = (c.bitdepth / 8) * c.channels;
         int packet_bytes    = c.pkt * bytes_per_frame;
         int got = 0;
+        /* Stable media clock: base the RTP timestamp on the PTP clock once, then advance
+         * it by the exact sample count per packet.  Reading the PHC per packet jitters
+         * (because the upstream pipe buffers), which makes an AES67 receiver drop the
+         * media-clock lock (stream flashes green then red).  A per-packet-increment clock
+         * is jitter-free and stays referenced to the PTP domain via the Sender Reports. */
+        uint32_t media_ts = (uint32_t)(phc_sec() * (double)c.rate);
         if (c.verbose) fprintf(stderr, "  reading %d bytes (%d frames) per packet\n",
                                packet_bytes, c.pkt);
         while (!g_stop) {
@@ -373,8 +379,8 @@ int main(int argc, char **argv)
             }
             if (got < packet_bytes) continue;
 
-            double t = phc_sec(); if (t < 0) t = 0;
-            uint32_t ts = (uint32_t)(t * (double)c.rate);
+            uint32_t ts = media_ts;
+            media_ts += (uint32_t)c.pkt;
             out[0]=0x80; out[1]=(unsigned char)(c.pt & 0x7f);
             out[2]=(seq>>8)&0xff; out[3]=seq&0xff;
             out[4]=(ts>>24)&0xff; out[5]=(ts>>16)&0xff; out[6]=(ts>>8)&0xff; out[7]=ts&0xff;
