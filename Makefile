@@ -2,12 +2,13 @@
 #
 CC       ?= cc
 CFLAGS   ?= -O2 -Wall -Wextra
+LDLIBS   ?= -lrt
 PREFIX   ?= /usr/local
 
 all: aes67-tx
 
 aes67-tx: aes67-tx.c
-	$(CC) $(CFLAGS) -o aes67-tx aes67-tx.c
+	$(CC) $(CFLAGS) -o aes67-tx aes67-tx.c $(LDLIBS)
 
 install: aes67-tx
 	install -D -m 0755 aes67-tx $(DESTDIR)$(PREFIX)/bin/aes67-tx
