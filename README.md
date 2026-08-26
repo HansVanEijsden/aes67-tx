@@ -1,5 +1,8 @@
 # aes67-tx
 
+[![CI build](https://github.com/HansVanEijsden/aes67-tx/actions/workflows/build.yml/badge.svg)](https://github.com/HansVanEijsden/aes67-tx/actions/workflows/build.yml)
+[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://github.com/HansVanEijsden/aes67-tx/blob/main/LICENSE)
+
 Publish an existing AES67/RTP audio stream as a **PTP-synchronised AES67 (Dante-compatible) source** on Linux.
 
 Many broadcast AES67/Dante receivers (mixers, MADI bridges, Dante Controllers) are strict: a source is only accepted if its RTP timestamps and RTCP **Sender Reports** reference the **PTP clock of the network's grandmaster**. Standard Linux audio tools (GStreamer, ffmpeg, VLC) send RTP on the *system* clock — usually NTP-based and unrelated to the audio-over-IP/PTP domain — so a Dante/AES67 device refuses the stream ("no signal", "no sync", "cannot subscribe: RTP not enabled", …).
@@ -29,8 +32,8 @@ The host running `aes67-tx` must be a **PTP slave of the console's grandmaster**
 flowchart LR
     ST["Stereo Tool / any AES67-RTP source<br/>(existing multicast group)"] -->|"AES67 / RTP (multicast)"| TX
     TX["aes67-tx (Linux, PTP slave)"] -->|"AES67 / RTP<br/>PTP-synced (Sender Reports)"| NET["Dante / AES67 network"]
-    NET --> BRIDGE["VertoMX / MADI bridge"]
-    BRIDGE --> CONSOLE["Dante / AES67 console"]
+    NET --> BRIDGE["VertoMX (Dante→MADI bridge)"]
+    BRIDGE --> CONSOLE["MADI console"]
 ```
 
 - It forwards the RTP **payload bytes unchanged** (no decode/encode). The output format is therefore the same as the input (e.g. `L24/48000/2`).
