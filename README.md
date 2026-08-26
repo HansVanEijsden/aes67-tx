@@ -141,9 +141,9 @@ it as AES67, re-stamping every packet from the PTP clock. Combine it with a deco
 produces PCM at the session rate, e.g.:
 
 ```sh
-# 16-bit source -> scale to 24-bit (volume=48.1648dB = x256 so the level is preserved)
+# 16-bit source -> ffmpeg scales it to 24-bit automatically when you output s24le
 ffmpeg -hide_banner -loglevel error -reconnect 1 -reconnect_streamed 1 -reconnect_delay_max 5 \
-  -i "https://example.org/station" -vn -af "volume=48.1648dB" -f s24le -ar 48000 -ac 2 - \
+  -i "https://example.org/station" -vn -f s24le -ar 48000 -ac 2 - \
   | aes67-tx --raw -a 239.69.100.2 -p 5004 -f eth0 -b 24 -C 2 -n 48 -v
 ```
 
@@ -151,9 +151,8 @@ ffmpeg -hide_banner -loglevel error -reconnect 1 -reconnect_streamed 1 -reconnec
 - **AES67 L16/L24 are big-endian**; `aes67-tx --raw` byte-swaps the little-endian PCM it
   reads (from ffmpeg) to the big-endian RTP payload automatically.
 - **A PCM24 receiver (many Dante bridges) rejects `L16` flows.** If your device is configured
-  for 24-bit, output `L24`. When the source is 16-bit, scale it up: `-af "volume=48.1648dB"`
-  (`×256`) keeps the level correct (without this the 16-bit content sits too quiet in a
-  24-bit container).
+  for 24-bit, output `L24`. When you decode a 16-bit source and write `-f s24le`, ffmpeg
+  scales the 16-bit to 24-bit itself, so no extra gain filter is needed.
 - `-n 48` = 48 frames/packet (≈1 ms at 48 kHz). Keep the SDP's `a=ptime` in agreement.
 - `ffmpeg -reconnect ...` reconnects over short outages; `aes67-tx --raw` exits on upstream
   EOF so a supervising `systemd` unit (`Restart=always`) re-spawns the pipeline for longer
