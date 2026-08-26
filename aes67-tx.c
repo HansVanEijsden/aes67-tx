@@ -65,7 +65,7 @@
 #include <net/if.h>
 
 #define PROGRAM   "aes67-tx"
-#define VERSION   "1.0.0"
+#define VERSION   "1.1.0"
 
 /* POSIX clock number of a PTP hardware clock (PHC), as used by linuxptp.
  * It is the same magic value for every /dev/ptpN; the kernel resolves it to
@@ -121,8 +121,10 @@ static void usage(const char *prog)
         "PTP / timing\n"
         "  -d, --ptp-device <path>   PTP hardware clock    (default " DEFAULT_PTP ")\n"
         "  -r, --sr-interval <sec>   Sender Report interval (default 1)\n"
-        "  -R, --re-stamp            re-stamp RTP timestamps from the PTP clock\n"
-        "                            (default: forward the source timestamps)\n"
+        "  -R, --re-stamp            re-stamp RTP timestamps from the PTP clock (default)\n"
+        "  -K, --keep-ts             forward the source RTP timestamps instead\n"
+        "                            (only if the source already follows the grandmaster;\n"
+        "                            recommended: leave -R on for non-PTP sources)\n"
         "  -B, --rate <hz>           RTP clock rate for --re-stamp (default 48000)\n"
         "\n"
         "Other\n"
@@ -184,6 +186,11 @@ int main(int argc, char **argv)
     memset(&c, 0, sizeof c);
     c.in_port = 5004; c.out_port = 5004; c.pt = 96; c.ttl = 8;
     c.sr_interval = 1; c.ssrc = 0; c.rate = 48000; c.iface[0] = 0;
+    /* Default: re-stamp from the PTP clock. A non-PTP source (e.g. Stereo Tool)
+     * uses the system clock, so forwarding its timestamps is not in lockstep
+     * with the grandmaster and Dante keeps the channel muted. Re-stamping from
+     * the PHC makes the media clock run in lockstep with the domain. */
+    c.restamp = 1;
     strcpy(c.ptp_dev, DEFAULT_PTP);
     snprintf(c.in_addr, 64, "239.192.19.137");
     snprintf(c.out_addr, 64, "239.69.100.1");
@@ -201,13 +208,14 @@ int main(int argc, char **argv)
         {"ptp-device",   required_argument, 0, 'd'},
         {"sr-interval",  required_argument, 0, 'r'},
         {"re-stamp",     no_argument,       0, 'R'},
+        {"keep-ts",      no_argument,       0, 'K'},
         {"rate",         required_argument, 0, 'B'},
         {"verbose",      no_argument,       0, 'v'},
         {"help",         no_argument,       0, 'h'},
         {0,0,0,0}
     };
     int copt;
-    while ((copt = getopt_long(argc, argv, "A:P:S:a:p:k:t:l:f:d:r:RB:vh", opts, NULL)) != -1) {
+    while ((copt = getopt_long(argc, argv, "A:P:S:a:p:k:t:l:f:d:r:RB:Kvh", opts, NULL)) != -1) {
         switch (copt) {
         case 'A': snprintf(c.in_addr, 64, "%s", optarg); break;
         case 'P': c.in_port = atoi(optarg); break;
@@ -223,6 +231,7 @@ int main(int argc, char **argv)
         case 'd': snprintf(c.ptp_dev, 128, "%s", optarg); break;
         case 'r': c.sr_interval = atoi(optarg); break;
         case 'R': c.restamp = 1; break;
+        case 'K': c.restamp = 0; break;
         case 'B': c.rate = atoi(optarg); break;
         case 'v': c.verbose = 1; break;
         case 'h': usage(argv[0]); return 0;

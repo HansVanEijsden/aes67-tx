@@ -19,7 +19,8 @@ OUTPUT_PORT="5004"
 IFACE="eth0"                    # interface carrying the output multicast
 PTP_DEV="/dev/ptp0"             # the PTP-slaved hardware clock
 PT="96"                         # output RTP payload type
-RESTAMP="no"                    # "yes" to re-stamp from the PTP clock
+RESTAMP="yes"                    # "yes" = re-stamp from the PTP clock (recommended, default);
+                                 # "no"  = forward the source timestamps (only if PTP-synced)
 RATE="48000"
 
 # --- build command --------------------------------------------------------
@@ -29,7 +30,7 @@ if [ -n "$INPUT_SDP" ]; then
 else
     set -- "$@" -A "$INPUT_ADDR" -P "$INPUT_PORT"
 fi
-[ "$RESTAMP" = "yes" ] && set -- "$@" -R -B "$RATE"
+if [ "$RESTAMP" = "yes" ]; then set -- "$@" -R -B "$RATE"; else set -- "$@" -K; fi
 set -- "$@" -v
 
 echo "Starting: sudo $BIN $*"

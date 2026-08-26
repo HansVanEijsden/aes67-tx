@@ -36,9 +36,9 @@ flowchart LR
 ```
 
 - It forwards the RTP **payload bytes unchanged** (no decode/encode). The output format is therefore the same as the input (e.g. `L24/48000/2`).
-- It rewrites the RTP header: new SSRC, new sequence number, and — by default — keeps the source's RTP timestamps.
+- It rewrites the RTP header: new SSRC, new sequence number, and — by default — **re-stamps each packet from the PTP clock** (the PHC), so the media clock runs in lockstep with the grandmaster.
 - It sends **RTCP Sender Reports** every second. The Sender Report's timestamp is taken from the **PHC** (the NIC's PTP-synchronised hardware clock), so the receiver can lock the media clock to the PTP grandmaster.
-- `--re-stamp` instead timestamps each packet directly from the PHC (see below).
+- `--keep-ts` instead forwards the source's own RTP timestamps (only sensible if the source already follows the grandmaster).
 
 ---
 
@@ -110,7 +110,8 @@ sudo ./aes67-tx \
 -f, --iface <name>         output interface, e.g. eth0
 -d, --ptp-device <path>    PTP hardware clock                (default /dev/ptp0)
 -r, --sr-interval <sec>    Sender Report interval            (default 1)
--R, --re-stamp             re-stamp RTP timestamps from the PTP clock
+-R, --re-stamp             re-stamp RTP timestamps from the PTP clock (default)
+-K, --keep-ts              forward the source RTP timestamps instead
 -B, --rate <hz>            RTP clock rate for --re-stamp     (default 48000)
 -v, --verbose              log progress to stderr
 -h, --help                 show help
@@ -122,8 +123,11 @@ Use either `-A/-P` (address and port) or `-S <sdp-file>`. An SDP is handy when y
 
 ### Choosing the output timestamp strategy
 
-- **Default (forward source timestamps):** the media clock keeps the source's rate and phase; the Sender Reports map it onto the PTP domain time. This is the usual case and works well when the source and the grandmaster are close.
-- **`--re-stamp`:** each RTP packet is timestamped directly from the PHC, making the media clock *itself* the PTP domain clock. Use this when you want a strictly PTP-locked source and the source rate closely matches the PHC rate. Specify the clock rate with `--rate`.
+This is the part that makes or breaks a Dante/AES67 receiver accepting the stream.
+
+- **`--re-stamp` (default):** each RTP packet is timestamped **from the PTP clock (PHC)**. The media clock runs *in lockstep* with the grandmaster, which is exactly what Dante requires. **Use this when the source does not follow the grandmaster** — which is the common case (e.g. Stereo Tool, which uses the *system* clock). Specify the session clock rate with `--rate`.
+
+- **`--keep-ts`:** forwards the source's own RTP timestamps. Only use this if the source is already PTP-synchronised. If you forward the timestamps of a *non-PTP* source, the media clock does not run in lockstep with the grandmaster: the receiver sees a "latency" (clock offset) that **jumps around on every stream restart**, and a Dante device will show the flow as **connected but muted** (green, no sound). This is a known symptom when a processor like Stereo Tool emits AES67 without slaving to the grandmaster. `aes67-tx` in `--re-stamp` mode re-timestamps from the PHC so the source *is* in lockstep.
 
 ### Output interface
 
@@ -212,6 +216,7 @@ The newly published source is a normal AES67 multicast stream on the output grou
 | Source appears but subscription is refused, or flow is red | The stream is not PTP-synced. Make sure the host is a PTP slave (`portState = SLAVE`) and Sender Reports are being sent (`tcpdump ... port 5005`). |
 | "RTP not enabled on RX device" | Enable AES67 on the receiving device. DVS (Dante Virtual Soundcard) has no AES67 receive — use a hardware Dante/AES67 device. |
 | `ptp4l` stuck in `UNCALIBRATED` | The grandmaster only answers unicast delay requests — add `hybrid_e2e 1` (see above). |
+| Flow is green but **muted**, or no "playing" speaker; latency value jumps on each restart | The media clock is not in lockstep with the grandmaster — likely because the source's timestamps are forwarded instead of re-stamped. Use the default **`--re-stamp`** (ensure you are not passing `--keep-ts`). |
 | Flow is green but no signal on the mixer | The destination (e.g. a MADI/console output) may be inactive, or the AES67 source needs `ts-refclk` to fully lock. Try `example-sdp-refclk.txt`. |
 | No audio data / silence | Check the source multicast is flowing (`tcpdump -i eth0 "udp port 5004"`), that you are using the right interface (`-f`), and that the source is not silent. |
 | Sender Report interval too aggressive | `--sr-interval` is in seconds; leave at least 1. |
