@@ -1,0 +1,20 @@
+# ptp-watchdog.service - restart ptp4l if the PTP slave clock gets stuck after a
+# grandmaster/switch reboot.  When the grandmaster (e.g. a Dante bridge, free-running
+# class-248) reboots its clock resets; ptp4l usually re-syncs but can get stuck, which
+# breaks every AES67 source until it is restarted.  This unit watches the PTP time
+# status and restarts ptp4l when the offset stays too large.  See ptp-watchdog.sh.
+#
+# Install:  cp ptp-watchdog.sh /usr/local/bin/ && chmod +x /usr/local/bin/ptp-watchdog.sh
+#           cp ptp-watchdog.service /etc/systemd/system/ && systemctl enable --now ptp-watchdog
+[Unit]
+Description=PTP clock watchdog - restart ptp4l if the slave clock is stuck
+After=ptp4l-slave-eno1.service
+
+[Service]
+Type=simple
+ExecStart=/usr/local/bin/ptp-watchdog.sh
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target

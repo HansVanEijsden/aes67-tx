@@ -285,6 +285,35 @@ sudo systemctl enable --now aes67-1zwolle-hd aes67-salland1-hd
 Both units wait for the PTP slave (`ptp4l-slave-eno1.service`) before starting, so the PTP
 clock is ready before the AES67 sources come up.
 
+### Keep the PTP slave healthy across reboots (`ptp-watchdog`)
+
+A strict AES67/Dante receiver requires the source's media clock to reference the PTP
+grandmaster. If the grandmaster (often a Dante bridge / VertoMX, a *free-running*
+class-248 clock) reboots, its clock resets to an arbitrary value (observed ~4 h off).
+`ptp4l` (slave-only) normally re-synchronises, but it can occasionally get stuck holding
+the old (wrong) time — and then every AES67 source is off by a large offset until `ptp4l`
+is restarted.
+
+The included **`ptp-watchdog`** makes this automatic and fail-safe:
+
+```sh
+sudo cp ptp-watchdog.sh  /usr/local/bin/ && sudo chmod +x /usr/local/bin/ptp-watchdog.sh
+sudo cp ptp-watchdog.service /etc/systemd/system/
+sudo systemctl daemon-reload
+sudo systemctl enable --now ptp-watchdog
+```
+
+It reads the PTP `TIME_STATUS_NP` every 10 s and restarts `ptp4l-slave-eno1.service` only
+when the master is present **and** the clock offset has been wrong (> 1 ms) for ~60 s. It
+deliberately does nothing while the master is absent (power off / switch down), so it never
+fights a still-booting network. Because `aes67-tx` reads the hardware clock on every packet,
+it follows `ptp4l` automatically: once the slave clock is corrected the streams recover
+without restarting `aes67-tx`.
+
+For a fully hands-off studio bring-up, set `Restart=always` on `ptp4l` and the `aes67-tx`
+units (as in the examples) so every component re-spawns itself after a crash or outage,
+and the source flows also wait on `network-online.target`.
+
 ---
 
 ## License
