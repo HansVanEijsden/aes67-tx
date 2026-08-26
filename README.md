@@ -18,8 +18,7 @@ It is a small, single-file C program with no runtime dependencies beyond a PTP-c
 A broadcast processor (e.g. **Thimeo Stereo Tool**) emits AES67 / LiveWire audio on one multicast group. You want that same audio available on a mixing console (or a Dante→MADI bridge) that only accepts Dante/AES67 on another group / clock domain.
 
 ```
-Stereo Tool  ── AES67/RTP ──>  [ NIC eth0 ] aes67-tx  ── AES67/RTP (PTP) ──>  Dante/AES67 console
-                                                                                 (via Dante Controller)
+Stereo Tool  ── AES67/RTP ──>  [eth0] aes67-tx  ── AES67/RTP (PTP) ──>  [VertoMX]  ── MADI ──>  console
 ```
 
 The host running `aes67-tx` must be a **PTP slave of the console's grandmaster**.
@@ -67,10 +66,16 @@ sudo make install   # optional: installs to /usr/local/bin/aes67-tx
 
 ---
 
-## Quick start
+## Example: Stereo Tool → MADI console
 
-1. Make the host a PTP slave (see below), so `/dev/ptp0` follows the grandmaster.
-2. Run the transmitter, reading your source and writing to a fresh multicast group:
+End-to-end: take **Thimeo Stereo Tool**'s AES67/LiveWire output and make it available on a
+mixing console via a Dante→MADI bridge.
+
+1. **Sync the PTP clock** — the host must follow the console's grandmaster. Configure
+   `ptp4l` in slave-only mode and confirm `portState = SLAVE` (see
+   [Setting up the PTP slave](#setting-up-the-ptp-slave)).
+
+2. **Publish the stream.** Read Stereo Tool's AES67 output and write it to a fresh group:
 
 ```sh
 sudo ./aes67-tx \
@@ -79,9 +84,15 @@ sudo ./aes67-tx \
   -f eth0 -v
 ```
 
-3. In **Dante Controller** (or your AES67 controller): **File → External SDP Sessions → Add**, paste the matching SDP (see `example-sdp.txt`), then subscribe the new source to your device (bridge/mixer inputs) and route it.
+3. **Subscribe in Dante Controller.** Add the matching SDP (see [Example SDP](#example-sdp) /
+   `example-sdp.txt`; change `YOUR-HOST-IP`), then subscribe the flow to your device and
+   **route it to the MADI output** (via the VertoMX).
 
-The new stream should now be accepted with a green/locked flow and produce audio.
+4. **Turn the console on.** The VertoMX converts Dante→MADI; with the console running, the
+   (delayed) on-air signal appears on the **MADI console**.
+
+> If the receiver refuses the flow ("RTP not enabled on RX device"), enable **AES67** on the
+> receiving device — a hardware Dante/AES67 device, not a DVS (Dante-only) host.
 
 ---
 
