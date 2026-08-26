@@ -65,7 +65,7 @@
 #include <net/if.h>
 
 #define PROGRAM   "aes67-tx"
-#define VERSION   "1.3.0"
+#define VERSION   "1.3.1"
 
 /* POSIX clock number of a PTP hardware clock (PHC), as used by linuxptp.
  * It is the same magic value for every /dev/ptpN; the kernel resolves it to
@@ -449,14 +449,24 @@ int main(int argc, char **argv)
                 if (c.verbose) fprintf(stderr, "input EOF (upstream stopped) - exiting so systemd restarts\n");
                 break;
             } else {
-                /* not due yet, and/or waiting on stdin: sleep until the next slot or
-                 * a short while if the ring still has no data */
-                double wait = target - now_s;
-                int timeout_ms = (int)(wait * 1000.0);
-                if (timeout_ms < 0) timeout_ms = 0;
-                if (timeout_ms > 4) timeout_ms = 4;
-                struct pollfd p; p.fd = 0; p.events = POLLIN;
-                poll(&p, 1, timeout_ms);
+                /* Not emitting right now.
+                 *  - ring has data: sleep *precisely* to the next media-clock slot with
+                 *    clock_nanosleep (absolute).  Poll's timeout is millisecond-granular so
+                 *    a sub-ms remaining wait truncates to 0 -> busy-spin; this avoids that
+                 *    and keeps the emit on time without burning a core.
+                 *  - ring is empty (waiting on upstream data): poll stdin for a short
+                 *    while; never use a 0ms timeout here or we spin during an upstream
+                 *    stall. */
+                if (jl > 0) {
+                    struct timespec ts;
+                    ts.tv_sec = (time_t)target;
+                    ts.tv_nsec = (long)((target - (double)ts.tv_sec) * 1e9);
+                    if (ts.tv_nsec > 999999999L) ts.tv_nsec = 999999999L;
+                    clock_nanosleep(CLOCK_MONOTONIC, TIMER_ABSTIME, &ts, NULL);
+                } else {
+                    struct pollfd p; p.fd = 0; p.events = POLLIN;
+                    poll(&p, 1, 4);
+                }
             }
         }
         for (int i = 0; i < jb; i++) free(jbq[i]);
