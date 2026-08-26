@@ -117,6 +117,7 @@ sudo ./aes67-tx \
 -b, --bit <16|24>          PCM bits per sample for --raw      (default 24)
 -C, --channels <n>         channels for --raw                 (default 2)
 -n, --pkt <frames>         frames per RTP packet for --raw    (default 48 = 1 ms)
+-J, --jitter <pkts>        jitter-buffer depth for --raw      (default 32 = 32 ms)
 -v, --verbose              log progress to stderr
 -h, --help                 show help
 ```
@@ -154,6 +155,12 @@ ffmpeg -hide_banner -loglevel error -reconnect 1 -reconnect_streamed 1 -reconnec
   for 24-bit, output `L24`. When you decode a 16-bit source and write `-f s24le`, ffmpeg
   scales the 16-bit to 24-bit itself, so no extra gain filter is needed.
 - `-n 48` = 48 frames/packet (≈1 ms at 48 kHz). Keep the SDP's `a=ptime` in agreement.
+- `-J <N>` = jitter-buffer depth in packets. A live decoder (network FLAC/Ogg) delivers data
+  in bursts and gaps; `aes67-tx --raw` reads ahead `N` packets from stdin into a ring and
+  emits one packet per media-clock slot, so the receiver sees an even pace instead of the
+  upstream bursts (which overflow an AES67 receiver's jitter buffer — "Late" spikes / link
+  drops). Default 32 (≈32 ms at 48 kHz / 48-frame packets); raise it (e.g. `-J 256`) if your
+  uplink can stall for longer — the cost is that much added latency.
 - `ffmpeg -reconnect ...` reconnects over short outages; `aes67-tx --raw` exits on upstream
   EOF so a supervising `systemd` unit (`Restart=always`) re-spawns the pipeline for longer
   drops — together this gives automatic reconnection.

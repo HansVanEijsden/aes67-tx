@@ -10,10 +10,12 @@
 # ffmpeg -reconnect keeps reconnecting over short outages; aes67-tx exits on upstream EOF so
 # systemd ("Restart=always") re-spawns the whole pipeline to rejoin. Automatic reconnection.
 #
-# Adjust the URL, -a/-p (output AES67 group/port) and -f (iface) as needed.
-#
-# ffmpeg -reconnect keeps reconnecting over short outages; aes67-tx exits on upstream EOF so
-# systemd ("Restart=always") re-spawns the whole pipeline to rejoin. Automatic reconnection.
+# -J <N> is the jitter-buffer depth (in RTP packets): aes67-tx reads ahead this many packets
+# from stdin and emits one per media-clock slot.  A bursty live decoder (network FLAC/Ogg)
+# delivers data in bursts and gaps; without this the receiver's jitter buffer overflows
+# ("Late" spikes / link drops).  256 pkts ~ 256 ms.  Increase it (e.g. -J 512) if your uplink
+# stalls for longer; the cost is that much added latency.  aes67-tx stamps timestamps from the
+# PTP clock (PTP-locked), which is what a strict AES67/Dante receiver requires.
 #
 # Adjust the URL, -a/-p (output AES67 group/port) and -f (iface) as needed.
 [Unit]
@@ -23,7 +25,7 @@ Wants=network-online.target
 
 [Service]
 Type=simple
-ExecStart=/bin/bash -c 'ffmpeg -hide_banner -loglevel error -reconnect 1 -reconnect_streamed 1 -reconnect_delay_max 5 -i "https://radio.salland1.nl/salland1-flac" -vn -f s24le -ar 48000 -ac 2 - | /usr/local/bin/aes67-tx --raw -a 239.69.100.2 -p 5004 -f eno1 -b 24 -C 2 -n 48 -v'
+ExecStart=/bin/bash -c 'ffmpeg -hide_banner -loglevel error -reconnect 1 -reconnect_streamed 1 -reconnect_delay_max 5 -i "https://radio.salland1.nl/salland1-flac" -vn -f s24le -ar 48000 -ac 2 - | /usr/local/bin/aes67-tx --raw -a 239.69.100.2 -p 5004 -f eno1 -b 24 -C 2 -n 48 -J 256 -v'
 Restart=always
 RestartSec=2
 
