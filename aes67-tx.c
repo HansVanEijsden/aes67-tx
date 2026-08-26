@@ -65,7 +65,7 @@
 #include <net/if.h>
 
 #define PROGRAM   "aes67-tx"
-#define VERSION   "1.2.1"
+#define VERSION   "1.2.3"
 
 /* POSIX clock number of a PTP hardware clock (PHC), as used by linuxptp.
  * It is the same magic value for every /dev/ptpN; the kernel resolves it to
@@ -353,11 +353,15 @@ int main(int argc, char **argv)
         int bytes_per_frame = (c.bitdepth / 8) * c.channels;
         int packet_bytes    = c.pkt * bytes_per_frame;
         int got = 0;
-        /* Stable media clock: base the RTP timestamp on the PTP clock once, then advance
-         * it by the exact sample count per packet.  Reading the PHC per packet jitters
-         * (because the upstream pipe buffers), which makes an AES67 receiver drop the
-         * media-clock lock (stream flashes green then red).  A per-packet-increment clock
-         * is jitter-free and stays referenced to the PTP domain via the Sender Reports. */
+        /* Pace output to a steady media-clock rate so a bursty upstream (e.g. ffmpeg
+         * decoding a network FLAC stream) does not produce bursts of packets that make
+         * an AES67 receiver's jitter buffer overflow ("Late" spikes, link drops). The
+         * stdin pipe acts as the buffer that absorbs upstream bursts. */
+        double pkt_period = (double)c.pkt / (double)c.rate;   /* e.g. 48/48000 = 1 ms */
+        uint64_t pkt_index = 0;
+        double base_s = 0;
+        if (c.verbose) fprintf(stderr, "  reading %d bytes (%d frames) per packet, paced to %.2f ms\n",
+                               packet_bytes, c.pkt, pkt_period * 1000.0);
         if (c.verbose) fprintf(stderr, "  reading %d bytes (%d frames) per packet\n",
                                packet_bytes, c.pkt);
         while (!g_stop) {
@@ -405,6 +409,17 @@ int main(int argc, char **argv)
                     }
                 }
             }
+            /* Pace: wait until this packet's scheduled media-clock slot. */
+            struct timespec nowt; clock_gettime(CLOCK_MONOTONIC, &nowt);
+            double now_s = nowt.tv_sec + nowt.tv_nsec / 1e9;
+            if (pkt_index == 0) base_s = now_s;
+            double target = base_s + (double)pkt_index * pkt_period;
+            if (target > now_s) {
+                useconds_t us = (useconds_t)((target - now_s) * 1e6);
+                if (us > 0 && us < 100000) usleep(us);
+            }
+            pkt_index++;
+
             sendto(tx, out, 12+packet_bytes, 0, (struct sockaddr *)&txa, sizeof txa);
             seq++; lastts=ts; pktcnt++; octet += packet_bytes; got = 0;
 
