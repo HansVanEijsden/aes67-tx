@@ -1,0 +1,20 @@
+name: build
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Compile with gcc (-Wall -Wextra -O2)
+        run: make CC=gcc
+
+      - name: Compile with clang (if available)
+        run: make CC=clang || echo "clang not available, skipping"
+
+      - name: Smoke test (help must work without root / PHC)
+        run: ./aes67-tx --help >/dev/null

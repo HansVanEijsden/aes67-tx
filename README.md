@@ -25,6 +25,14 @@ The host running `aes67-tx` must be a **PTP slave of the console's grandmaster**
 
 ## How it works
 
+```mermaid
+flowchart LR
+    ST["Stereo Tool / any AES67-RTP source<br/>(existing multicast group)"] -->|"AES67 / RTP (multicast)"| TX
+    TX["aes67-tx (Linux, PTP slave)"] -->|"AES67 / RTP<br/>PTP-synced (Sender Reports)"| NET["Dante / AES67 network"]
+    NET --> BRIDGE["VertoMX / MADI bridge"]
+    BRIDGE --> CONSOLE["Dante / AES67 console"]
+```
+
 - It forwards the RTP **payload bytes unchanged** (no decode/encode). The output format is therefore the same as the input (e.g. `L24/48000/2`).
 - It rewrites the RTP header: new SSRC, new sequence number, and — by default — keeps the source's RTP timestamps.
 - It sends **RTCP Sender Reports** every second. The Sender Report's timestamp is taken from the **PHC** (the NIC's PTP-synchronised hardware clock), so the receiver can lock the media clock to the PTP grandmaster.
