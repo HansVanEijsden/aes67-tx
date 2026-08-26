@@ -223,6 +223,8 @@ Two ready-made examples are in the repository: `example-sdp.txt` (no `ts-refclk`
 2. Select your device (the mixer, the MADI bridge, the DVS host). If a receiver complains **"RTP not enabled on RX device"**, enable **AES67** in that device's config — note that *Dante Virtual Soundcard (DVS)* is Dante-only and does **not** receive AES67; use a hardware Dante/AES67 device instead.
 3. Subscribe the new channels and route them to the output, then confirm the flow shows signal/audio.
 
+> **Each SDP needs a unique session ID.** Dante Controller identifies an External SDP Session by the *session id* in the `o=` line (the number after the username, e.g. `o=- 1 1 IN IP4 ...`). If you import a second SDP that uses the same session id, Dante asks *"A session with session ID N already exists. Do you want to replace the existing session?"*. Give every imported SDP its own session id — e.g. use `o=- 1 1 ...`, `o=- 2 1 ...`, `o=- 3 1 ...` for successive sources.
+
 ---
 
 ## Where the audio ends up
