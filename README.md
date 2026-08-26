@@ -113,6 +113,10 @@ sudo ./aes67-tx \
 -R, --re-stamp             re-stamp RTP timestamps from the PTP clock (default)
 -K, --keep-ts              forward the source RTP timestamps instead
 -B, --rate <hz>            RTP clock rate for --re-stamp     (default 48000)
+-W, --raw                  read raw PCM on stdin instead of an RTP source
+-b, --bit <16|24>          PCM bits per sample for --raw      (default 24)
+-C, --channels <n>         channels for --raw                 (default 2)
+-n, --pkt <frames>         frames per RTP packet for --raw    (default 48 = 1 ms)
 -v, --verbose              log progress to stderr
 -h, --help                 show help
 ```
@@ -128,6 +132,28 @@ This is the part that makes or breaks a Dante/AES67 receiver accepting the strea
 - **`--re-stamp` (default):** each RTP packet is timestamped **from the PTP clock (PHC)**. The media clock runs *in lockstep* with the grandmaster, which is exactly what Dante requires. **Use this when the source does not follow the grandmaster** — which is the common case (e.g. Stereo Tool, which uses the *system* clock). Specify the session clock rate with `--rate`.
 
 - **`--keep-ts`:** forwards the source's own RTP timestamps. Only use this if the source is already PTP-synchronised. If you forward the timestamps of a *non-PTP* source, the media clock does not run in lockstep with the grandmaster: the receiver sees a "latency" (clock offset) that **jumps around on every stream restart**, and a Dante device will show the flow as **connected but muted** (green, no sound). This is a known symptom when a processor like Stereo Tool emits AES67 without slaving to the grandmaster. `aes67-tx` in `--re-stamp` mode re-timestamps from the PHC so the source *is* in lockstep.
+
+### Feeding it a non-RTP source (--raw)
+
+Use `--raw` when your audio is not already on RTP/AES67 — e.g. a network IceCast/FLAC
+stream, a file, or a sound card. It reads raw interleaved PCM from **stdin** and packetises
+it as AES67, re-stamping every packet from the PTP clock. Combine it with a decoder that
+produces PCM at the session rate, e.g.:
+
+```sh
+ffmpeg -hide_banner -loglevel error -reconnect 1 -reconnect_streamed 1 -reconnect_delay_max 5 \
+  -i "https://example.org/station" -vn -f s16le -ar 48000 -ac 2 - \
+  | aes67-tx --raw -a 239.69.100.2 -p 5004 -f eth0 -b 16 -C 2 -n 48 -v
+```
+
+- `-b 16`/`-b 24` set the PCM width; the AES67 payload becomes `L16`/`L24` accordingly.
+- `-n 48` = 48 frames/packet (≈1 ms at 48 kHz). Keep the SDP's `a=ptime` in agreement.
+- `ffmpeg -reconnect ...` reconnects over short outages; `aes67-tx --raw` exits on upstream
+  EOF so a supervising `systemd` unit (`Restart=always`) re-spawns the pipeline for longer
+  drops — together this gives automatic reconnection.
+- The stream must decode to the session sample rate (here 48 kHz stereo). If the source is
+  16-bit, output `L16` (native level); if you prefer `L24`, resample with scaling so the
+  level is preserved.
 
 ### Output interface
 
@@ -220,6 +246,31 @@ The newly published source is a normal AES67 multicast stream on the output grou
 | Flow is green but no signal on the mixer | The destination (e.g. a MADI/console output) may be inactive, or the AES67 source needs `ts-refclk` to fully lock. Try `example-sdp-refclk.txt`. |
 | No audio data / silence | Check the source multicast is flowing (`tcpdump -i eth0 "udp port 5004"`), that you are using the right interface (`-f`), and that the source is not silent. |
 | Sender Report interval too aggressive | `--sr-interval` is in seconds; leave at least 1. |
+
+---
+
+## Real-world examples (two streams)
+
+The repository includes working `systemd` units under `examples/` that publish two channels
+simultaneously on one host, each on its own multicast group:
+
+- `examples/aes67-1zwolle-hd.service` — re-publishes a source AES67/RTP stream (a broadcast
+  processor / LiveWire) as **L24** AES67 on `239.69.100.1`.
+- `examples/aes67-salland1-hd.service` — decodes a network IceCast/FLAC stream with ffmpeg
+  and publishes it as **L16** AES67 on `239.69.100.2` (handy when the studio can't yet send
+  AES67/Dante directly), with automatic reconnection on internet drops.
+
+Each channel uses its own output group and its own SDP: `example-sdp.txt` (L24) and
+`example-sdp-l16.txt` (L16). Install and start them with:
+
+```sh
+sudo cp examples/*.service /etc/systemd/system/
+sudo systemctl daemon-reload
+sudo systemctl enable --now aes67-1zwolle-hd aes67-salland1-hd
+```
+
+Both units wait for the PTP slave (`ptp4l-slave-eno1.service`) before starting, so the PTP
+clock is ready before the AES67 sources come up.
 
 ---
 

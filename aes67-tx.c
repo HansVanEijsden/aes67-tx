@@ -91,6 +91,10 @@ typedef struct {
     int    sr_interval;      /* RTCP Sender Report interval (s)  */
     int    restamp;          /* 1 = re-stamp ts from PTP clock   */
     int    rate;             /* RTP clock rate for --re-stamp    */
+    int    raw;              /* 1 = read raw PCM from stdin      */
+    int    bitdepth;         /* PCM bits per sample (16/24)      */
+    int    channels;         /* number of channels               */
+    int    pkt;              /* samples (frames) per RTP packet  */
     int    verbose;          /* log progress                     */
 } cfg_t;
 
@@ -126,6 +130,10 @@ static void usage(const char *prog)
         "                            (only if the source already follows the grandmaster;\n"
         "                            recommended: leave -R on for non-PTP sources)\n"
         "  -B, --rate <hz>           RTP clock rate for --re-stamp (default 48000)\n"
+        "  -W, --raw                 read raw PCM on stdin instead of an RTP source\n"
+        "  -b, --bit <16|24>         PCM bits per sample for --raw    (default 24)\n"
+        "  -C, --channels <n>        channels for --raw               (default 2)\n"
+        "  -n, --pkt <frames>        frames per RTP packet for --raw  (default 48 = 1 ms)\n"
         "\n"
         "Other\n"
         "  -v, --verbose             log progress to stderr\n"
@@ -180,12 +188,34 @@ static uint32_t iface_ipv4(const char *name)
     return addr;
 }
 
+/* Send an RTCP Sender Report, mapping the current media clock (lastts) to the
+ * PTP domain time.  Sent to the RTCP port (RTP port + 1) on the output group. */
+static void send_sr(int tx, struct sockaddr_in *txa, uint32_t ssrc,
+                    uint64_t pktcnt, uint64_t octet, uint32_t lastts)
+{
+    double t = phc_sec();
+    if (t < 0) return;
+    uint8_t sr[28]; memset(sr, 0, 28);
+    sr[0] = 0x80; sr[1] = 200; sr[2] = 0; sr[3] = 6;      /* SR */
+    sr[4] = (ssrc>>24)&0xff; sr[5] = (ssrc>>16)&0xff; sr[6] = (ssrc>>8)&0xff; sr[7] = ssrc&0xff;
+    double nt = t + (double)NTP_1900;
+    uint32_t ns = (uint32_t)nt, nf = (uint32_t)((nt - ns) * 4294967296.0);
+    sr[8] = (ns>>24)&0xff;  sr[9] = (ns>>16)&0xff;  sr[10] = (ns>>8)&0xff;  sr[11] = ns&0xff;
+    sr[12] = (nf>>24)&0xff; sr[13] = (nf>>16)&0xff; sr[14] = (nf>>8)&0xff;  sr[15] = nf&0xff;
+    sr[16] = (lastts>>24)&0xff; sr[17] = (lastts>>16)&0xff; sr[18] = (lastts>>8)&0xff; sr[19] = lastts&0xff;
+    sr[20] = (pktcnt>>24)&0xff; sr[21] = (pktcnt>>16)&0xff; sr[22] = (pktcnt>>8)&0xff; sr[23] = pktcnt&0xff;
+    sr[24] = (octet>>24)&0xff;  sr[25] = (octet>>16)&0xff;  sr[26] = (octet>>8)&0xff;  sr[27] = octet&0xff;
+    struct sockaddr_in ra = *txa; ra.sin_port = htons(ntohs(txa->sin_port) + 1);
+    sendto(tx, sr, 28, 0, (struct sockaddr *)&ra, sizeof(ra));
+}
+
 int main(int argc, char **argv)
 {
     cfg_t c;
     memset(&c, 0, sizeof c);
     c.in_port = 5004; c.out_port = 5004; c.pt = 96; c.ttl = 8;
     c.sr_interval = 1; c.ssrc = 0; c.rate = 48000; c.iface[0] = 0;
+    c.bitdepth = 24; c.channels = 2; c.pkt = 48; c.raw = 0;
     /* Default: re-stamp from the PTP clock. A non-PTP source (e.g. Stereo Tool)
      * uses the system clock, so forwarding its timestamps is not in lockstep
      * with the grandmaster and Dante keeps the channel muted. Re-stamping from
@@ -210,12 +240,16 @@ int main(int argc, char **argv)
         {"re-stamp",     no_argument,       0, 'R'},
         {"keep-ts",      no_argument,       0, 'K'},
         {"rate",         required_argument, 0, 'B'},
+        {"raw",          no_argument,       0, 'W'},
+        {"bit",          required_argument, 0, 'b'},
+        {"channels",     required_argument, 0, 'C'},
+        {"pkt",          required_argument, 0, 'n'},
         {"verbose",      no_argument,       0, 'v'},
         {"help",         no_argument,       0, 'h'},
         {0,0,0,0}
     };
     int copt;
-    while ((copt = getopt_long(argc, argv, "A:P:S:a:p:k:t:l:f:d:r:RB:Kvh", opts, NULL)) != -1) {
+    while ((copt = getopt_long(argc, argv, "A:P:S:a:p:k:t:l:f:d:r:RB:KWb:C:n:vh", opts, NULL)) != -1) {
         switch (copt) {
         case 'A': snprintf(c.in_addr, 64, "%s", optarg); break;
         case 'P': c.in_port = atoi(optarg); break;
@@ -233,6 +267,10 @@ int main(int argc, char **argv)
         case 'R': c.restamp = 1; break;
         case 'K': c.restamp = 0; break;
         case 'B': c.rate = atoi(optarg); break;
+        case 'W': c.raw = 1; break;
+        case 'b': c.bitdepth = atoi(optarg); break;
+        case 'C': c.channels = atoi(optarg); break;
+        case 'n': c.pkt = atoi(optarg); break;
         case 'v': c.verbose = 1; break;
         case 'h': usage(argv[0]); return 0;
         default : usage(argv[0]); return 1;
@@ -250,26 +288,29 @@ int main(int argc, char **argv)
         return 1;
     }
 
-    /* --- input socket: join the multicast group ---------------------- */
-    int rx = socket(AF_INET, SOCK_DGRAM, 0);
-    if (rx < 0) { perror("rx socket"); return 1; }
-    int one = 1;
-    setsockopt(rx, SOL_SOCKET, SO_REUSEADDR, &one, sizeof one);
+    /* --- input socket (RTP source): join the multicast group -------- */
+    int rx = -1;
+    if (!c.raw) {
+        rx = socket(AF_INET, SOCK_DGRAM, 0);
+        if (rx < 0) { perror("rx socket"); return 1; }
+        int one = 1;
+        setsockopt(rx, SOL_SOCKET, SO_REUSEADDR, &one, sizeof one);
 #ifdef SO_REUSEPORT
-    setsockopt(rx, SOL_SOCKET, SO_REUSEPORT, &one, sizeof one);
+        setsockopt(rx, SOL_SOCKET, SO_REUSEPORT, &one, sizeof one);
 #endif
-    struct sockaddr_in rxa; memset(&rxa, 0, sizeof rxa);
-    rxa.sin_family = AF_INET;
-    rxa.sin_addr.s_addr = inet_addr(c.in_addr);
-    rxa.sin_port = htons(c.in_port);
-    struct ip_mreq m; memset(&m, 0, sizeof m);
-    m.imr_multiaddr.s_addr = inet_addr(c.in_addr);
-    m.imr_interface.s_addr = htonl(INADDR_ANY);
-    if (setsockopt(rx, IPPROTO_IP, IP_ADD_MEMBERSHIP, &m, sizeof m) < 0) {
-        perror("IP_ADD_MEMBERSHIP"); return 1;
-    }
-    if (bind(rx, (struct sockaddr *)&rxa, sizeof rxa) < 0) {
-        perror("bind rx"); return 1;
+        struct sockaddr_in rxa; memset(&rxa, 0, sizeof rxa);
+        rxa.sin_family = AF_INET;
+        rxa.sin_addr.s_addr = inet_addr(c.in_addr);
+        rxa.sin_port = htons(c.in_port);
+        struct ip_mreq m; memset(&m, 0, sizeof m);
+        m.imr_multiaddr.s_addr = inet_addr(c.in_addr);
+        m.imr_interface.s_addr = htonl(INADDR_ANY);
+        if (setsockopt(rx, IPPROTO_IP, IP_ADD_MEMBERSHIP, &m, sizeof m) < 0) {
+            perror("IP_ADD_MEMBERSHIP"); return 1;
+        }
+        if (bind(rx, (struct sockaddr *)&rxa, sizeof rxa) < 0) {
+            perror("bind rx"); return 1;
+        }
     }
 
     /* --- output socket ---------------------------------------------- */
@@ -294,87 +335,105 @@ int main(int argc, char **argv)
 
     if (c.verbose) {
         fprintf(stderr, "%s %s\n", PROGRAM, VERSION);
-        fprintf(stderr, "  input   %s:%d\n", c.in_addr, c.in_port);
+        if (c.raw)
+            fprintf(stderr, "  input   stdin (raw %s%d, %d Hz, %d ch, %d frames/pkt)\n",
+                    c.bitdepth == 24 ? "S24LE " : "S16LE ", c.bitdepth, c.rate, c.channels, c.pkt);
+        else
+            fprintf(stderr, "  input   %s:%d\n", c.in_addr, c.in_port);
         fprintf(stderr, "  output  %s:%d  (ttl=%d iface=%s pt=%d ssrc=0x%08x)\n",
                 c.out_addr, c.out_port, c.ttl, c.iface[0] ? c.iface : "(auto)", c.pt, ssrc);
         fprintf(stderr, "  ptp     %s  restamp=%s  sr_every=%ds\n",
                 c.ptp_dev, c.restamp ? "yes" : "no (forward source ts)", c.sr_interval);
     }
 
-    struct pollfd pf; pf.fd = rx; pf.events = POLLIN;
     unsigned char in[2048], out[1600];
 
-    while (!g_stop) {
-        int pr = poll(&pf, 1, 1000);
-        if (pr <= 0) continue;
-        int n = recvfrom(rx, in, sizeof in, 0, NULL, NULL);
-        if (n < 12) continue;
-        if ((in[0] >> 6) != 2) continue;                /* RTP v2 only */
-        /* compute RTP header size: 12 + CSRC count + optional extension */
-        int hdr = 12 + 4 * (in[0] & 0x0f);
-        if (in[0] & 0x10) {
-            if (n < hdr + 4) continue;
-            unsigned len = ((unsigned)in[hdr+2] << 8) | in[hdr+3];
-            hdr += 4 + 4 * (int)len;
-        }
-        if (hdr >= n) continue;
-        int plen = n - hdr;
-        if (plen <= 0) continue;
+    if (c.raw) {
+        /* ---- raw PCM input from stdin -------------------------------- */
+        int bytes_per_frame = (c.bitdepth / 8) * c.channels;
+        int packet_bytes    = c.pkt * bytes_per_frame;
+        int got = 0;
+        if (c.verbose) fprintf(stderr, "  reading %d bytes (%d frames) per packet\n",
+                               packet_bytes, c.pkt);
+        while (!g_stop) {
+            int eof = 0;
+            while (got < packet_bytes) {
+                int r = read(0, in + got, packet_bytes - got);
+                if (r < 0) {
+                    if (errno == EINTR) continue;
+                    if (errno == EAGAIN) { usleep(5000); continue; }
+                    eof = 1; break;
+                }
+                if (r == 0) { eof = 1; break; }
+                got += r;
+            }
+            if (eof) {
+                if (c.verbose) fprintf(stderr, "input EOF (upstream stopped) - exiting so systemd restarts\n");
+                break;
+            }
+            if (got < packet_bytes) continue;
 
-        uint32_t ts;
-        if (c.restamp) {
-            double t = phc_sec();
-            if (t < 0) t = 0;
-            ts = (uint32_t)(t * (double)c.rate);
-        } else {
-            ts = ((uint32_t)in[4] << 24) | ((uint32_t)in[5] << 16) |
-                 ((uint32_t)in[6] << 8)  |  (uint32_t)in[7];
-        }
+            double t = phc_sec(); if (t < 0) t = 0;
+            uint32_t ts = (uint32_t)(t * (double)c.rate);
+            out[0]=0x80; out[1]=(unsigned char)(c.pt & 0x7f);
+            out[2]=(seq>>8)&0xff; out[3]=seq&0xff;
+            out[4]=(ts>>24)&0xff; out[5]=(ts>>16)&0xff; out[6]=(ts>>8)&0xff; out[7]=ts&0xff;
+            out[8]=(ssrc>>24)&0xff; out[9]=(ssrc>>16)&0xff; out[10]=(ssrc>>8)&0xff; out[11]=ssrc&0xff;
+            memcpy(out+12, in, packet_bytes);
+            sendto(tx, out, 12+packet_bytes, 0, (struct sockaddr *)&txa, sizeof txa);
+            seq++; lastts=ts; pktcnt++; octet += packet_bytes; got = 0;
 
-        out[0] = 0x80; out[1] = (unsigned char)(c.pt & 0x7f);
-        out[2] = (seq >> 8) & 0xff; out[3] = seq & 0xff;
-        out[4] = (ts >> 24) & 0xff; out[5] = (ts >> 16) & 0xff;
-        out[6] = (ts >> 8) & 0xff;  out[7] = ts & 0xff;
-        out[8] = (ssrc >> 24) & 0xff; out[9] = (ssrc >> 16) & 0xff;
-        out[10] = (ssrc >> 8) & 0xff; out[11] = ssrc & 0xff;
-        memcpy(out + 12, in + hdr, plen);
-        if (sendto(tx, out, 12 + plen, 0, (struct sockaddr *)&txa, sizeof txa) < 0) {
-            if (c.verbose && errno != EAGAIN) perror("sendto");
-        }
-        seq++; lastts = ts; pktcnt++; octet += plen;
-
-        /* RTCP Sender Report - maps media clock to PTP domain time */
-        time_t now = time(NULL);
-        if (c.sr_interval > 0 && now != lastSR) {
-            lastSR = now;
-            double t = phc_sec();
-            if (t >= 0) {
-                uint8_t sr[28]; memset(sr, 0, 28);
-                sr[0] = 0x80; sr[1] = 200; sr[2] = 0; sr[3] = 6;   /* SR */
-                sr[4] = (ssrc >> 24) & 0xff; sr[5] = (ssrc >> 16) & 0xff;
-                sr[6] = (ssrc >> 8) & 0xff;  sr[7] = ssrc & 0xff;
-                double nt = t + (double)NTP_1900;
-                uint32_t ns = (uint32_t)nt;
-                uint32_t nf = (uint32_t)((nt - ns) * 4294967296.0);
-                sr[8] = (ns >> 24) & 0xff;  sr[9] = (ns >> 16) & 0xff;
-                sr[10] = (ns >> 8) & 0xff;  sr[11] = ns & 0xff;
-                sr[12] = (nf >> 24) & 0xff; sr[13] = (nf >> 16) & 0xff;
-                sr[14] = (nf >> 8) & 0xff;  sr[15] = nf & 0xff;
-                sr[16] = (lastts >> 24) & 0xff; sr[17] = (lastts >> 16) & 0xff;
-                sr[18] = (lastts >> 8) & 0xff;  sr[19] = lastts & 0xff;
-                sr[20] = (pktcnt >> 24) & 0xff; sr[21] = (pktcnt >> 16) & 0xff;
-                sr[22] = (pktcnt >> 8) & 0xff;  sr[23] = pktcnt & 0xff;
-                sr[24] = (octet >> 24) & 0xff;  sr[25] = (octet >> 16) & 0xff;
-                sr[26] = (octet >> 8) & 0xff;   sr[27] = octet & 0xff;
-                struct sockaddr_in ra = txa; ra.sin_port = htons(c.out_port + 1);
-                sendto(tx, sr, 28, 0, (struct sockaddr *)&ra, sizeof ra);
+            time_t now = time(NULL);
+            if (c.sr_interval > 0 && now != lastSR) { lastSR = now; send_sr(tx,&txa,ssrc,pktcnt,octet,lastts); }
+            if (c.verbose && now != lastLog) {
+                lastLog = now;
+                fprintf(stderr, "seq=%u ts=%u pkt=%llu\n", seq, ts, (unsigned long long)pktcnt);
             }
         }
+    } else {
+        /* ---- RTP source input --------------------------------------- */
+        struct pollfd pf; pf.fd = rx; pf.events = POLLIN;
+        while (!g_stop) {
+            int pr = poll(&pf, 1, 1000);
+            if (pr <= 0) continue;
+            int n = recvfrom(rx, in, sizeof in, 0, NULL, NULL);
+            if (n < 12) continue;
+            if ((in[0] >> 6) != 2) continue;                    /* RTP v2 only */
+            /* RTP header size: 12 + CSRC count + optional extension */
+            int hdr = 12 + 4 * (in[0] & 0x0f);
+            if (in[0] & 0x10) {
+                if (n < hdr + 4) continue;
+                unsigned len = ((unsigned)in[hdr+2] << 8) | in[hdr+3];
+                hdr += 4 + 4 * (int)len;
+            }
+            if (hdr >= n) continue;
+            int plen = n - hdr;
+            if (plen <= 0) continue;
 
-        if (c.verbose && now != lastLog) {
-            lastLog = now;
-            fprintf(stderr, "seq=%u ts=%u pkt=%llu\n", seq, ts,
-                    (unsigned long long)pktcnt);
+            uint32_t ts;
+            if (c.restamp) {
+                double t = phc_sec(); if (t < 0) t = 0;
+                ts = (uint32_t)(t * (double)c.rate);
+            } else {
+                ts = ((uint32_t)in[4]<<24)|((uint32_t)in[5]<<16)|((uint32_t)in[6]<<8)|(uint32_t)in[7];
+            }
+
+            out[0]=0x80; out[1]=(unsigned char)(c.pt & 0x7f);
+            out[2]=(seq>>8)&0xff; out[3]=seq&0xff;
+            out[4]=(ts>>24)&0xff; out[5]=(ts>>16)&0xff; out[6]=(ts>>8)&0xff; out[7]=ts&0xff;
+            out[8]=(ssrc>>24)&0xff; out[9]=(ssrc>>16)&0xff; out[10]=(ssrc>>8)&0xff; out[11]=ssrc&0xff;
+            memcpy(out+12, in+hdr, plen);
+            if (sendto(tx, out, 12+plen, 0, (struct sockaddr *)&txa, sizeof txa) < 0) {
+                if (c.verbose && errno != EAGAIN) perror("sendto");
+            }
+            seq++; lastts=ts; pktcnt++; octet += plen;
+
+            time_t now = time(NULL);
+            if (c.sr_interval > 0 && now != lastSR) { lastSR = now; send_sr(tx,&txa,ssrc,pktcnt,octet,lastts); }
+            if (c.verbose && now != lastLog) {
+                lastLog = now;
+                fprintf(stderr, "seq=%u ts=%u pkt=%llu\n", seq, ts, (unsigned long long)pktcnt);
+            }
         }
     }
 
