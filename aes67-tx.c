@@ -65,7 +65,7 @@
 #include <net/if.h>
 
 #define PROGRAM   "aes67-tx"
-#define VERSION   "1.1.0"
+#define VERSION   "1.2.0"
 
 /* POSIX clock number of a PTP hardware clock (PHC), as used by linuxptp.
  * It is the same magic value for every /dev/ptpN; the kernel resolves it to
