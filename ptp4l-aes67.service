@@ -1,0 +1,14 @@
+[Unit]
+Description=PTP slave for the AES67/Dante domain (slave only, never grandmaster)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+# Adjust the interface (-i eth0) and the config path if needed.
+ExecStart=/usr/sbin/ptp4l -i eth0 -s -f /etc/linuxptp/aes67.conf
+Restart=on-failure
+RestartSec=3
+
+[Install]
+WantedBy=multi-user.target

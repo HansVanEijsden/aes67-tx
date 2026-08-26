@@ -1,0 +1,15 @@
+[Unit]
+Description=aes67-tx - publish an AES67/RTP stream as a PTP-synchronised AES67 source
+After=network-online.target ptp4l-aes67.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+# Adjust the source (-A/-P or -S), output (-a/-p), interface (-f), PTP device (-d)
+# and payload type (-t) to match your setup and the SDP you paste into the controller.
+ExecStart=/usr/local/bin/aes67-tx -A 239.192.19.137 -P 5004 -a 239.69.100.1 -p 5004 -f eth0 -v
+Restart=on-failure
+RestartSec=3
+
+[Install]
+WantedBy=multi-user.target
