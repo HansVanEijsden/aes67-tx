@@ -65,7 +65,7 @@
 #include <net/if.h>
 
 #define PROGRAM   "aes67-tx"
-#define VERSION   "1.3.1"
+#define VERSION   "1.4.0"
 
 /* POSIX clock number of a PTP hardware clock (PHC), as used by linuxptp.
  * It is the same magic value for every /dev/ptpN; the kernel resolves it to
@@ -339,6 +339,13 @@ int main(int argc, char **argv)
     uint32_t ssrc = c.ssrc ? c.ssrc : (uint32_t)((getpid() ^ (uint32_t)time(NULL)) & 0x7fffffff);
     uint32_t seq = (uint32_t)time(NULL) & 0xff;
     uint64_t pktcnt = 0, octet = 0; uint32_t lastts = 0; time_t lastSR = 0, lastLog = 0;
+    /* Smooth, PTP-seeded media clock.  Re-stamping every packet from the raw PHC
+     * read (phc_sec()*rate) jitters (a hardware-clock read + the servo are not
+     * perfectly even), which shows up as a ragged/overdriven distortion on a strict
+     * receiver.  Seeding once from the PHC and advancing by the exact sample count
+     * per packet gives a clean, even media clock that is still PTP-referenced via
+     * the Sender Reports. */
+    uint32_t media_ts = 0;
 
     if (c.verbose) {
         fprintf(stderr, "%s %s\n", PROGRAM, VERSION);
@@ -418,8 +425,9 @@ int main(int argc, char **argv)
                  * never emit a burst of packets to "catch up" */
                 if (now_s - target > pkt_period) { base_s = now_s; slot = 0; }
                 unsigned char *p = jbq[jh];
-                double tclk = phc_sec(); if (tclk < 0) tclk = 0;
-                uint32_t ts = (uint32_t)(tclk * (double)c.rate);
+                if (media_ts == 0) { double s0 = phc_sec(); if (s0 < 0) s0 = 0; media_ts = (uint32_t)(s0 * (double)c.rate); }
+                uint32_t ts = media_ts;
+                media_ts += (uint32_t)c.pkt;                /* advance by exact sample count */
                 out[0]=0x80; out[1]=(unsigned char)(c.pt & 0x7f);
                 out[2]=(seq>>8)&0xff; out[3]=seq&0xff;
                 out[4]=(ts>>24)&0xff; out[5]=(ts>>16)&0xff; out[6]=(ts>>8)&0xff; out[7]=ts&0xff;
@@ -493,8 +501,14 @@ int main(int argc, char **argv)
 
             uint32_t ts;
             if (c.restamp) {
-                double t = phc_sec(); if (t < 0) t = 0;
-                ts = (uint32_t)(t * (double)c.rate);
+                /* Smooth media clock: seed once from the PHC, then advance by the exact
+                 * sample count per packet.  Re-reading the raw PHC each packet jitters. */
+                int bps = c.bitdepth / 8, nch = c.channels > 0 ? c.channels : 2;
+                int samples_per_pkt = plen / (bps * nch);
+                if (samples_per_pkt <= 0) samples_per_pkt = c.pkt;
+                if (media_ts == 0) { double s0 = phc_sec(); if (s0 < 0) s0 = 0; media_ts = (uint32_t)(s0 * (double)c.rate); }
+                ts = media_ts;
+                media_ts += (uint32_t)samples_per_pkt;
             } else {
                 ts = ((uint32_t)in[4]<<24)|((uint32_t)in[5]<<16)|((uint32_t)in[6]<<8)|(uint32_t)in[7];
             }
