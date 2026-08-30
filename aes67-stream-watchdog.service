@@ -1,0 +1,22 @@
+# aes67-stream-watchdog.service - restart the Salland1 FLAC pipeline if it stops
+# producing (e.g. ffmpeg hangs on a decoder/CRC error instead of reconnecting).
+# systemd Restart=always only re-spawns when the process exits; this watchdog
+# watches the output multicast and restarts the service if it is silent too long.
+# See aes67-stream-watchdog.sh.
+#
+# Install:
+#   cp aes67-stream-watchdog.sh /usr/local/bin/ && chmod +x /usr/local/bin/aes67-stream-watchdog.sh
+#   cp aes67-stream-watchdog.service /etc/systemd/system/ && systemctl enable --now aes67-stream-watchdog
+[Unit]
+Description=AES67 stream watchdog - restart Salland1 if it stops producing
+After=network-online.target aes67-salland1-hd.service
+
+[Service]
+Type=simple
+ExecStart=/usr/local/bin/aes67-stream-watchdog.sh
+Restart=always
+RestartSec=5
+Nice=10
+
+[Install]
+WantedBy=multi-user.target

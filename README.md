@@ -316,6 +316,31 @@ For a fully hands-off studio bring-up, set `Restart=always` on `ptp4l` and the `
 units (as in the examples) so every component re-spawns itself after a crash or outage,
 and the source flows also wait on `network-online.target`.
 
+### Keep a decoded-network stream producing (`aes67-stream-watchdog`)
+
+`ffmpeg -reconnect` recovers from a network EOF, but on a **decoder/CRC error** it can
+*hang* instead of reconnecting — leaving `aes67-tx --raw` with an empty pipe and `0`
+packets out. `systemd Restart=always` only re-spawns when the process *exits*; a hung
+`ffmpeg` never exits. The included **`aes67-stream-watchdog`** fixes this:
+
+```sh
+sudo cp aes67-stream-watchdog.sh /usr/local/bin/ && sudo chmod +x /usr/local/bin/aes67-stream-watchdog.sh
+sudo cp aes67-stream-watchdog.service /etc/systemd/system/
+sudo systemctl daemon-reload
+sudo systemctl enable --now aes67-stream-watchdog
+```
+
+It watches the output multicast group (`239.69.100.2`, edit in the script) and, if it
+stays silent for ~24 s (hung `ffmpeg`, network/switch drop, stream error — anything),
+restarts `aes67-salland1-hd.service`, which kills the stuck pipeline and re-spawns so
+`ffmpeg` reconnects. It stays quiet while the stream is healthy and recovers automatically
+after any drop. Tune `DST`/`PORT`/`CAPTURE`/`BAD_LIMIT` in `aes67-stream-watchdog.sh` for
+other groups or a different silence threshold.
+
+A source that is merely forwarded as AES67/RTP (e.g. `aes67-1zwolle-hd`) does not have this
+`ffmpeg` failure mode: it re-publishes whatever arrives, so the source flow recovers on its
+own once the upstream returns — no watchdog needed there.
+
 ---
 
 ## License
