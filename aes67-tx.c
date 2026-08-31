@@ -65,7 +65,7 @@
 #include <net/if.h>
 
 #define PROGRAM   "aes67-tx"
-#define VERSION   "1.4.0"
+#define VERSION   "1.4.1"
 
 /* POSIX clock number of a PTP hardware clock (PHC), as used by linuxptp.
  * It is the same magic value for every /dev/ptpN; the kernel resolves it to
@@ -295,6 +295,26 @@ int main(int argc, char **argv)
         return 1;
     }
 
+    /* Measure the PTP clock rate (how many PTP seconds pass per MONOTONIC second).
+     * The grandmaster is often a *free-running* class-248 clock (e.g. a Dante bridge)
+     * whose oscillator is not exactly 48000/48000; the PTP slave tracks it.  A media
+     * clock advanced by the plain sample count runs at the *system* (MONOTONIC) rate,
+     * which drifts a few ppm from the free-running grandmaster -> over a long session
+     * the receiver's jitter buffer overruns ("Late", latency climbing).  Advancing the
+     * media clock by 'sample_step * phc_rate' keeps it in lockstep with the grandmaster. */
+    double phc_rate = 1.0;
+    {
+        struct timespec tt; double m0, m1, p0, p1;
+        usleep(1000000);                              /* let the slave settle a moment */
+        clock_gettime(CLOCK_MONOTONIC, &tt); m0 = tt.tv_sec + tt.tv_nsec / 1e9;
+        p0 = phc_sec(); if (p0 < 0) p0 = 0;
+        usleep(2000000);
+        clock_gettime(CLOCK_MONOTONIC, &tt); m1 = tt.tv_sec + tt.tv_nsec / 1e9;
+        p1 = phc_sec(); if (p1 < 0) p1 = p0 + (m1 - m0);
+        if (m1 > m0) phc_rate = (p1 - p0) / (m1 - m0);
+    }
+    if (c.verbose) fprintf(stderr, "  ptp     phc_rate=%.6f (media clock locked to PTP rate)\n", phc_rate);
+
     /* --- input socket (RTP source): join the multicast group -------- */
     int rx = -1;
     if (!c.raw) {
@@ -346,6 +366,7 @@ int main(int argc, char **argv)
      * per packet gives a clean, even media clock that is still PTP-referenced via
      * the Sender Reports. */
     uint32_t media_ts = 0;
+    double   mts_acc  = 0.0;   /* fractional media-clock accumulator (raw mode, PTP-rate locked) */
 
     if (c.verbose) {
         fprintf(stderr, "%s %s\n", PROGRAM, VERSION);
@@ -425,9 +446,9 @@ int main(int argc, char **argv)
                  * never emit a burst of packets to "catch up" */
                 if (now_s - target > pkt_period) { base_s = now_s; slot = 0; }
                 unsigned char *p = jbq[jh];
-                if (media_ts == 0) { double s0 = phc_sec(); if (s0 < 0) s0 = 0; media_ts = (uint32_t)(s0 * (double)c.rate); }
-                uint32_t ts = media_ts;
-                media_ts += (uint32_t)c.pkt;                /* advance by exact sample count */
+                if (mts_acc == 0) { double s0 = phc_sec(); if (s0 < 0) s0 = 0; mts_acc = s0 * (double)c.rate; }
+                uint32_t ts = (uint32_t)mts_acc;
+                mts_acc += (double)c.pkt * phc_rate;        /* advance at the PTP rate (no drift) */
                 out[0]=0x80; out[1]=(unsigned char)(c.pt & 0x7f);
                 out[2]=(seq>>8)&0xff; out[3]=seq&0xff;
                 out[4]=(ts>>24)&0xff; out[5]=(ts>>16)&0xff; out[6]=(ts>>8)&0xff; out[7]=ts&0xff;
