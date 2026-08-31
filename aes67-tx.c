@@ -54,6 +54,7 @@
 #include <fcntl.h>
 #include <errno.h>
 #include <time.h>
+#include <math.h>
 #include <stdint.h>
 #include <getopt.h>
 #include <signal.h>
@@ -65,7 +66,7 @@
 #include <net/if.h>
 
 #define PROGRAM   "aes67-tx"
-#define VERSION   "1.4.1"
+#define VERSION   "1.5.0"
 
 /* POSIX clock number of a PTP hardware clock (PHC), as used by linuxptp.
  * It is the same magic value for every /dev/ptpN; the kernel resolves it to
@@ -295,26 +296,6 @@ int main(int argc, char **argv)
         return 1;
     }
 
-    /* Measure the PTP clock rate (how many PTP seconds pass per MONOTONIC second).
-     * The grandmaster is often a *free-running* class-248 clock (e.g. a Dante bridge)
-     * whose oscillator is not exactly 48000/48000; the PTP slave tracks it.  A media
-     * clock advanced by the plain sample count runs at the *system* (MONOTONIC) rate,
-     * which drifts a few ppm from the free-running grandmaster -> over a long session
-     * the receiver's jitter buffer overruns ("Late", latency climbing).  Advancing the
-     * media clock by 'sample_step * phc_rate' keeps it in lockstep with the grandmaster. */
-    double phc_rate = 1.0;
-    {
-        struct timespec tt; double m0, m1, p0, p1;
-        usleep(1000000);                              /* let the slave settle a moment */
-        clock_gettime(CLOCK_MONOTONIC, &tt); m0 = tt.tv_sec + tt.tv_nsec / 1e9;
-        p0 = phc_sec(); if (p0 < 0) p0 = 0;
-        usleep(2000000);
-        clock_gettime(CLOCK_MONOTONIC, &tt); m1 = tt.tv_sec + tt.tv_nsec / 1e9;
-        p1 = phc_sec(); if (p1 < 0) p1 = p0 + (m1 - m0);
-        if (m1 > m0) phc_rate = (p1 - p0) / (m1 - m0);
-    }
-    if (c.verbose) fprintf(stderr, "  ptp     phc_rate=%.6f (media clock locked to PTP rate)\n", phc_rate);
-
     /* --- input socket (RTP source): join the multicast group -------- */
     int rx = -1;
     if (!c.raw) {
@@ -366,7 +347,6 @@ int main(int argc, char **argv)
      * per packet gives a clean, even media clock that is still PTP-referenced via
      * the Sender Reports. */
     uint32_t media_ts = 0;
-    double   mts_acc  = 0.0;   /* fractional media-clock accumulator (raw mode, PTP-rate locked) */
 
     if (c.verbose) {
         fprintf(stderr, "%s %s\n", PROGRAM, VERSION);
@@ -394,112 +374,200 @@ int main(int argc, char **argv)
          * the raw stdin arrival times drive the network (which makes an AES67
          * receiver's jitter buffer overflow -> "Late" spikes / link drops), we drain
          * stdin into the ring and emit at an even, rock-solid pace. */
+        int bps = c.bitdepth / 8, nch = c.channels > 0 ? c.channels : 2;
         int jb = c.jbuf > 0 ? c.jbuf : 32;
-        unsigned char **jbq = calloc((size_t)jb, sizeof *jbq);
-        for (int i = 0; i < jb; i++) jbq[i] = malloc((size_t)packet_bytes);
-        unsigned char *cur = malloc((size_t)packet_bytes);
-        int got = 0, jh = 0, jl = 0;               /* ring head + fill level */
 
-        /* Media clock: stamp each emitted packet from the PTP clock.  This keeps the
-         * source PTP-referenced, which is what a strict AES67/Dante receiver requires
-         * (a clock locked to the content rate is rejected).  If the upstream content
-         * runs at a slightly different rate, the receiving device resamples it to the
-         * session rate; the jitter buffer below smooths the packet timing independently. */
-        double pkt_period = (double)c.pkt / (double)c.rate;   /* e.g. 48/48000 = 1 ms */
+        /* Measure the grandmaster (PHC) rate relative to the system clock.  A strict
+         * AES67 receiver plays the stream against the grandmaster clock and resamples
+         * away any mismatch; if the content stays on the system clock the source's
+         * media clock then drifts from the PHC and the receiver drops the stream
+         * ("Late", buffer fills, no audio).  We emit at the grandmaster rate and
+         * resample the system-rate content onto it with a fractional linear interpolator. */
+        double phc_rate = 1.0;
+        {
+            struct timespec a0, a1, b0, b1;
+            clock_gettime(CLOCK_MONOTONIC, &a0); clock_gettime(PHC_CLOCKID, &b0);
+            usleep(4000000);
+            clock_gettime(CLOCK_MONOTONIC, &a1); clock_gettime(PHC_CLOCKID, &b1);
+            long long da = (a1.tv_sec - a0.tv_sec) * 1000000000LL + (a1.tv_nsec - a0.tv_nsec);
+            long long db = (b1.tv_sec - b0.tv_sec) * 1000000000LL + (b1.tv_nsec - b0.tv_nsec);
+            if (da > 0 && db > 0) phc_rate = (double)db / (double)da;
+            if (!(phc_rate > 0.9995 && phc_rate < 1.0005)) phc_rate = 1.0;
+        }
         if (c.verbose)
-            fprintf(stderr, "  raw: %d bytes (%d frames)/pkt, paced %.2f ms, jitter buffer %d pkts (~%.0f ms)\n",
-                    packet_bytes, c.pkt, pkt_period * 1000.0, jb, pkt_period * jb * 1000.0);
+            fprintf(stderr, "  grandmaster rate %+.2f ppm vs system (resample ratio %.9f)\n",
+                    (phc_rate - 1.0) * 1e6, phc_rate);
+
+        /* Media-clock slot, in SYSTEM time, that keeps the emit running at the
+         * grandmaster rate (a few ppm above/below the nominal 1 ms). */
+        double pkt_period = (double)c.pkt / (double)c.rate;        /* 1 ms */
+        double slot_period = pkt_period / phc_rate;                /* ~1.00001 ms */
+        if (c.verbose)
+            fprintf(stderr, "  raw: %d bytes (%d frames)/pkt @ %d Hz, paced %.5f ms, jitter %d pkts\n",
+                    packet_bytes, c.pkt, c.rate, slot_period * 1000.0, jb);
 
         /* make stdin non-blocking so we can poll it against the send schedule */
         int f_orig = fcntl(0, F_GETFL, 0);
         fcntl(0, F_SETFL, f_orig | O_NONBLOCK);
 
-        /* pre-fill the jitter buffer so it can immediately absorb a burst */
+        /* --- resampler source buffer: interleaved 32-bit frames --- */
+        size_t cap = (size_t)(jb + 8) * (size_t)c.pkt + (size_t)c.pkt + 8;
+        int32_t *sb  = malloc(cap * (size_t)nch * sizeof *sb);
+        unsigned char *ib = malloc((size_t)packet_bytes + 16);
+        size_t slen = 0, igot = 0;                 /* buffered frames / undecoded bytes */
         int eof = 0;
-        while (jl < jb && !eof) {
-            int r = (int)read(0, cur + got, packet_bytes - got);
+
+        /* pre-fill a jitter-buffer of frames before the first emit, and ensure the
+         * resampler has enough lookahead to interpolate the first packet */
+        while (slen < (size_t)jb * (size_t)c.pkt && !eof) {
+            int r = (int)read(0, ib + igot, (size_t)packet_bytes - igot);
             if (r < 0) { if (errno == EINTR) continue; if (errno == EAGAIN) break; eof = 1; break; }
             if (r == 0) { eof = 1; break; }
-            got += r;
-            if (got == packet_bytes) { memcpy(jbq[(jh + jl) % jb], cur, packet_bytes); jl++; got = 0; }
+            igot += (size_t)r;
+            while (igot >= (size_t)bytes_per_frame && slen < cap) {
+                unsigned char *f = ib;
+                for (int ch = 0; ch < nch; ch++) {
+                    int v = (int)(unsigned char)f[ch*bps]
+                          | ((int)(unsigned char)f[ch*bps+1] << 8)
+                          | ((int)(unsigned char)f[ch*bps+2] << 16);
+                    if (v & 0x800000) v -= 0x1000000;               /* sign-extend 24-bit */
+                    sb[(slen * nch) + ch] = v;
+                }
+                memmove(ib, ib + bytes_per_frame, igot - (size_t)bytes_per_frame);
+                igot -= (size_t)bytes_per_frame;
+                slen++;
+            }
         }
 
         struct timespec nowt; clock_gettime(CLOCK_MONOTONIC, &nowt);
         double base_s = nowt.tv_sec + nowt.tv_nsec / 1e9;
+        double base_phc = phc_sec(); if (base_phc < 0) base_phc = base_s;
         uint64_t slot = 0;
+        double rpos = 0.0;                          /* source-frame position (fractional) */
+        double step = 1.0 / phc_rate;               /* source frames advanced per output frame */
 
         while (!g_stop) {
-            /* 1) drain any ready stdin bytes into the ring */
-            while (jl < jb && !eof) {
-                int r = (int)read(0, cur + got, packet_bytes - got);
-                if (r < 0) { if (errno == EINTR) continue; if (errno == EAGAIN) break; eof = 1; break; }
-                if (r == 0) { eof = 1; break; }
-                got += r;
-                if (got == packet_bytes) { memcpy(jbq[(jh + jl) % jb], cur, packet_bytes); jl++; got = 0; }
-            }
-            /* 2) emit one packet when its media-clock slot is due */
+            /* pace each media-clock slot against the PHC (the grandmaster) so the media
+             * clock tracks it exactly and never drifts from a once-measured value.  A
+             * content burst is drained AFTER the emit below, so it cannot delay this. */
             clock_gettime(CLOCK_MONOTONIC, &nowt);
             double now_s = nowt.tv_sec + nowt.tv_nsec / 1e9;
-            double target = base_s + (double)slot * pkt_period;
-            if (jl > 0 && now_s >= target) {
-                /* if an upstream gap made the schedule fall behind, restart it so we
-                 * never emit a burst of packets to "catch up" */
-                if (now_s - target > pkt_period) { base_s = now_s; slot = 0; }
-                unsigned char *p = jbq[jh];
-                if (mts_acc == 0) { double s0 = phc_sec(); if (s0 < 0) s0 = 0; mts_acc = s0 * (double)c.rate; }
-                uint32_t ts = (uint32_t)mts_acc;
-                mts_acc += (double)c.pkt * phc_rate;        /* advance at the PTP rate (no drift) */
+            double phc_now = phc_sec(); if (phc_now < 0) phc_now = base_phc;
+            double target_phc = base_phc + (double)slot * pkt_period;
+            size_t need = (size_t)rpos + (size_t)c.pkt + 1;
+
+            if (slen == 0 && eof) {
+                if (c.verbose) fprintf(stderr, "input EOF (upstream stopped) - exiting so systemd restarts\n");
+                break;
+            }
+
+            if (phc_now < target_phc) {
+                /* sleep to the MONO time at which the PHC will reach target_phc; the
+                 * re-check on phc_sec() below then fires the emit exactly at the PHC slot */
+                double rem = target_phc - phc_now;
+                double mono_target = now_s + rem / phc_rate;
+                struct timespec ts;
+                ts.tv_sec = (time_t)mono_target;
+                ts.tv_nsec = (long)((mono_target - (double)ts.tv_sec) * 1e9);
+                if (ts.tv_nsec > 999999999L) ts.tv_nsec = 999999999L;
+                clock_nanosleep(CLOCK_MONOTONIC, TIMER_ABSTIME, &ts, NULL);
+                continue;                       /* phc_now is ~target_phc; emit on next pass */
+            }
+
+            /* a media-clock slot is due.  Emit at the grandmaster rate ALWAYS (filling an
+             * upstream underrun with a zero packet and skipping the missing source frames)
+             * so the media clock never stalls/drifts from the grandmaster, which is what
+             * a strict receiver flags as "Late". */
+            {
+                /* restart the schedule if it genuinely fell behind (never burst) */
+                if (phc_now - target_phc > pkt_period) { base_phc = phc_now; slot = 0; }
+                if (media_ts == 0) { double s0 = phc_sec(); if (s0 < 0) s0 = 0; media_ts = (uint32_t)(s0 * (double)c.rate); }
+                uint32_t ts = media_ts;
+                media_ts += (uint32_t)c.pkt;                /* advance by exact sample count */
                 out[0]=0x80; out[1]=(unsigned char)(c.pt & 0x7f);
                 out[2]=(seq>>8)&0xff; out[3]=seq&0xff;
                 out[4]=(ts>>24)&0xff; out[5]=(ts>>16)&0xff; out[6]=(ts>>8)&0xff; out[7]=ts&0xff;
                 out[8]=(ssrc>>24)&0xff; out[9]=(ssrc>>16)&0xff; out[10]=(ssrc>>8)&0xff; out[11]=ssrc&0xff;
-                /* AES67 L16/L24 are big-endian; input PCM (from ffmpeg) is little-endian. */
-                {
-                    int spb = c.bitdepth / 8;               /* 2 (16-bit) or 3 (24-bit) */
-                    int samples = c.pkt * c.channels;
-                    uint8_t *dst = out + 12;
-                    if (spb == 3) {
-                        for (int s = 0; s < samples; s++) { int o = s * 3;
-                            dst[o] = p[o+2]; dst[o+1] = p[o+1]; dst[o+2] = p[o]; }
-                    } else {
-                        for (int s = 0; s < samples; s++) { int o = s * 2;
-                            dst[o] = p[o+1]; dst[o+1] = p[o]; }
+                if (slen > need) {
+                    /* Resample: linear interp at the fractional source position, so the
+                     * emitted (grandmaster-rate) content back-annotates the system-rate
+                     * decoder cleanly.  AES67 L24 is big-endian. */
+                    for (int k = 0; k < c.pkt; k++) {
+                        double fpos = rpos + (double)k * step;
+                        size_t fi = (size_t)fpos;
+                        double frac = fpos - (double)fi;
+                        for (int ch = 0; ch < nch; ch++) {
+                            double a = (double)sb[fi * nch + ch];
+                            double b = (double)sb[(fi + 1) * nch + ch];
+                            int v = (int)(a + (b - a) * frac);
+                            if (v > 0x7fffff) v = 0x7fffff; else if (v < -0x800000) v = -0x800000;
+                            size_t o = 12 + ((size_t)k * nch + (size_t)ch) * (size_t)bps;
+                            out[o]     = (unsigned char)((v >> 16) & 0xff);
+                            out[o + 1] = (unsigned char)((v >> 8)  & 0xff);
+                            out[o + 2] = (unsigned char)( v        & 0xff);
+                        }
                     }
+                    rpos += (double)c.pkt * step;
+                } else {
+                    /* upstream underrun: emit a zero packet, and skip the source position
+                     * forward so the media clock never falls behind the grandmaster */
+                    for (int k = 0; k < c.pkt * nch * bps; k++) out[12 + k] = 0;
+                    rpos += (double)c.pkt * step;
+                    if ((size_t)rpos > slen) rpos = (double)slen;
                 }
                 sendto(tx, out, 12 + packet_bytes, 0, (struct sockaddr *)&txa, sizeof txa);
                 seq++; lastts = ts; pktcnt++; octet += packet_bytes;
-                jh = (jh + 1) % jb; jl--; slot++;
+                slot++;
+                /* drop consumed frames from the front of the buffer */
+                if ((size_t)rpos > 1024) {
+                    size_t drop = (size_t)rpos;
+                    memmove(sb, sb + drop * nch, (slen - drop) * nch * sizeof *sb);
+                    slen -= drop;
+                    rpos -= (double)drop;
+                }
 
                 time_t now = time(NULL);
                 if (c.sr_interval > 0 && now != lastSR) { lastSR = now; send_sr(tx,&txa,ssrc,pktcnt,octet,lastts); }
                 if (c.verbose && now != lastLog) { lastLog = now;
-                    fprintf(stderr, "seq=%u ts=%u pkt=%llu\n", seq, ts, (unsigned long long)pktcnt); }
-            } else if (jl == 0 && eof) {
-                if (c.verbose) fprintf(stderr, "input EOF (upstream stopped) - exiting so systemd restarts\n");
-                break;
-            } else {
-                /* Not emitting right now.
-                 *  - ring has data: sleep *precisely* to the next media-clock slot with
-                 *    clock_nanosleep (absolute).  Poll's timeout is millisecond-granular so
-                 *    a sub-ms remaining wait truncates to 0 -> busy-spin; this avoids that
-                 *    and keeps the emit on time without burning a core.
-                 *  - ring is empty (waiting on upstream data): poll stdin for a short
-                 *    while; never use a 0ms timeout here or we spin during an upstream
-                 *    stall. */
-                if (jl > 0) {
-                    struct timespec ts;
-                    ts.tv_sec = (time_t)target;
-                    ts.tv_nsec = (long)((target - (double)ts.tv_sec) * 1e9);
-                    if (ts.tv_nsec > 999999999L) ts.tv_nsec = 999999999L;
-                    clock_nanosleep(CLOCK_MONOTONIC, TIMER_ABSTIME, &ts, NULL);
+                    double pc = phc_sec(); if (pc > 0) {
+                        double phcts = fmod(pc * (double)c.rate, 4294967296.0);
+                        double off = phcts - (double)ts;
+                        if (off > 2147483648.0) off -= 4294967296.0;
+                        if (off < -2147483648.0) off += 4294967296.0;
+                        fprintf(stderr, "seq=%u ts=%u pkt=%llu offset_sample=%+.0f (%+.3f ms)\n",
+                                seq, ts, (unsigned long long)pktcnt, off, off / (double)c.rate * 1000.0);
+                    }
+                }
+            }
+
+            /* 3) decode up to one packet's worth of stdin into the buffer (bounded so
+             *    a burst never delays the next emit -> keeps the timing even) */
+            if (!eof && slen < cap) {
+                int r = (int)read(0, ib + igot, (size_t)packet_bytes - igot);
+                if (r < 0) {
+                    if (errno == EINTR) continue;
+                    if (errno != EAGAIN) eof = 1;
+                } else if (r == 0) {
+                    eof = 1;
                 } else {
-                    struct pollfd p; p.fd = 0; p.events = POLLIN;
-                    poll(&p, 1, 4);
+                    igot += (size_t)r;
+                    while (igot >= (size_t)bytes_per_frame && slen < cap) {
+                        unsigned char *f = ib;
+                        for (int ch = 0; ch < nch; ch++) {
+                            int v = (int)(unsigned char)f[ch*bps]
+                                  | ((int)(unsigned char)f[ch*bps+1] << 8)
+                                  | ((int)(unsigned char)f[ch*bps+2] << 16);
+                            if (v & 0x800000) v -= 0x1000000;               /* sign-extend 24-bit */
+                            sb[(slen * nch) + ch] = v;
+                        }
+                        memmove(ib, ib + bytes_per_frame, igot - (size_t)bytes_per_frame);
+                        igot -= (size_t)bytes_per_frame;
+                        slen++;
+                    }
                 }
             }
         }
-        for (int i = 0; i < jb; i++) free(jbq[i]);
-        free(jbq); free(cur);
+        free(sb); free(ib);
     } else {
         /* ---- RTP source input --------------------------------------- */
         struct pollfd pf; pf.fd = rx; pf.events = POLLIN;

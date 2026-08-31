@@ -10,7 +10,8 @@ Wants=network-online.target
 
 [Service]
 Type=simple
-ExecStart=/usr/local/bin/aes67-tx -A 239.192.19.137 -P 5004 -a 239.69.100.1 -p 5004 -f eno1
+Nice=-10
+ExecStart=/usr/local/bin/aes67-tx -k 0x6a95A512 -A 239.192.19.137 -P 5004 -a 239.69.100.1 -p 5004 -f eno1
 Restart=always
 RestartSec=3
 
