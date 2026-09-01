@@ -2,7 +2,7 @@
 #
 CC       ?= cc
 CFLAGS   ?= -O2 -Wall -Wextra
-LDLIBS   ?= -lrt
+LDLIBS   ?= -lrt -lm
 PREFIX   ?= /usr/local
 
 all: aes67-tx

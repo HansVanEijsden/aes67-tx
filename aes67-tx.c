@@ -444,8 +444,7 @@ int main(int argc, char **argv)
         double base_phc = phc_sec(); if (base_phc < 0) base_phc = base_s;
         uint64_t slot = 0;
         double rpos = 0.0;                          /* source-frame position (fractional) */
-        double mts_acc = 0.0;                       /* fractional, PHC-driven media clock */
-        double phc_epoch = 0.0, mono_epoch = 0.0;   /* for the smoothed PHC rate */
+        double mts_acc = 0.0;                       /* fractional, PHC-seeded media clock */
 
         while (!g_stop) {
             /* pace each media-clock slot against the PHC (the grandmaster) so the media
@@ -482,18 +481,13 @@ int main(int argc, char **argv)
             {
                 /* restart the schedule if it genuinely fell behind (never burst) */
                 if (phc_now - target_phc > pkt_period) { base_phc = phc_now; slot = 0; }
-                /* Drive the media clock straight from the PHC so it tracks the grandmaster
-                 * exactly (no mono-clock conversion, no startup-measurement error).  A
-                 * fractional accumulator keeps the timestamp perfectly even. */
-                if (mts_acc == 0.0) { double s0 = phc_sec(); if (s0 < 0) s0 = 0; mts_acc = fmod(s0 * (double)c.rate, 4294967296.0); phc_epoch = phc_now; mono_epoch = now_s; }
-                /* Advance by a SMOOTHED PHC rate (the running average) so the media clock
-                 * is exact (tracks the grandmaster) AND even (no per-read jitter / ragged
-                 * distortion).  Falls back to the startup rate for the first handful of slots. */
-                double live_rate = (phc_now - phc_epoch) / (now_s - mono_epoch);
-                if (!(live_rate > 0.999 && live_rate < 1.001)) live_rate = phc_rate;
-                double mts_delta = live_rate * (double)c.pkt;
+                /* The media clock advances by the exact sample count per packet, and the
+                 * emit itself is paced at the PHC (grandmaster) slots above, so the rate is
+                 * the grandmaster rate automatically — no measured-rate bias, even clock. */
+                if (mts_acc == 0.0) { double s0 = phc_sec(); if (s0 < 0) s0 = 0; mts_acc = fmod(s0 * (double)c.rate, 4294967296.0); }
+                double mts_delta = (double)c.pkt;
                 mts_acc += mts_delta;
-                double cstep = mts_delta / (double)c.pkt;                        /* source frames per output frame */
+                double cstep = 1.0;                                             /* source frames per output frame */
                 uint32_t ts = (uint32_t)mts_acc;
                 media_ts = ts;
                 out[0]=0x80; out[1]=(unsigned char)(c.pt & 0x7f);
