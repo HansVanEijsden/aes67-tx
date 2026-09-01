@@ -444,7 +444,8 @@ int main(int argc, char **argv)
         double base_phc = phc_sec(); if (base_phc < 0) base_phc = base_s;
         uint64_t slot = 0;
         double rpos = 0.0;                          /* source-frame position (fractional) */
-        double step = 1.0 / phc_rate;               /* source frames advanced per output frame */
+        double mts_acc = 0.0;                       /* fractional, PHC-driven media clock */
+        double phc_epoch = 0.0, mono_epoch = 0.0;   /* for the smoothed PHC rate */
 
         while (!g_stop) {
             /* pace each media-clock slot against the PHC (the grandmaster) so the media
@@ -481,9 +482,20 @@ int main(int argc, char **argv)
             {
                 /* restart the schedule if it genuinely fell behind (never burst) */
                 if (phc_now - target_phc > pkt_period) { base_phc = phc_now; slot = 0; }
-                if (media_ts == 0) { double s0 = phc_sec(); if (s0 < 0) s0 = 0; media_ts = (uint32_t)(s0 * (double)c.rate); }
-                uint32_t ts = media_ts;
-                media_ts += (uint32_t)c.pkt;                /* advance by exact sample count */
+                /* Drive the media clock straight from the PHC so it tracks the grandmaster
+                 * exactly (no mono-clock conversion, no startup-measurement error).  A
+                 * fractional accumulator keeps the timestamp perfectly even. */
+                if (mts_acc == 0.0) { double s0 = phc_sec(); if (s0 < 0) s0 = 0; mts_acc = fmod(s0 * (double)c.rate, 4294967296.0); phc_epoch = phc_now; mono_epoch = now_s; }
+                /* Advance by a SMOOTHED PHC rate (the running average) so the media clock
+                 * is exact (tracks the grandmaster) AND even (no per-read jitter / ragged
+                 * distortion).  Falls back to the startup rate for the first handful of slots. */
+                double live_rate = (phc_now - phc_epoch) / (now_s - mono_epoch);
+                if (!(live_rate > 0.999 && live_rate < 1.001)) live_rate = phc_rate;
+                double mts_delta = live_rate * (double)c.pkt;
+                mts_acc += mts_delta;
+                double cstep = mts_delta / (double)c.pkt;                        /* source frames per output frame */
+                uint32_t ts = (uint32_t)mts_acc;
+                media_ts = ts;
                 out[0]=0x80; out[1]=(unsigned char)(c.pt & 0x7f);
                 out[2]=(seq>>8)&0xff; out[3]=seq&0xff;
                 out[4]=(ts>>24)&0xff; out[5]=(ts>>16)&0xff; out[6]=(ts>>8)&0xff; out[7]=ts&0xff;
@@ -493,7 +505,7 @@ int main(int argc, char **argv)
                      * emitted (grandmaster-rate) content back-annotates the system-rate
                      * decoder cleanly.  AES67 L24 is big-endian. */
                     for (int k = 0; k < c.pkt; k++) {
-                        double fpos = rpos + (double)k * step;
+                        double fpos = rpos + (double)k * cstep;
                         size_t fi = (size_t)fpos;
                         double frac = fpos - (double)fi;
                         for (int ch = 0; ch < nch; ch++) {
@@ -507,12 +519,12 @@ int main(int argc, char **argv)
                             out[o + 2] = (unsigned char)( v        & 0xff);
                         }
                     }
-                    rpos += (double)c.pkt * step;
+                    rpos += mts_delta;               /* advance content with the media clock */
                 } else {
                     /* upstream underrun: emit a zero packet, and skip the source position
                      * forward so the media clock never falls behind the grandmaster */
                     for (int k = 0; k < c.pkt * nch * bps; k++) out[12 + k] = 0;
-                    rpos += (double)c.pkt * step;
+                    rpos += mts_delta;
                     if ((size_t)rpos > slen) rpos = (double)slen;
                 }
                 sendto(tx, out, 12 + packet_bytes, 0, (struct sockaddr *)&txa, sizeof txa);
