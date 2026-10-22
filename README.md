@@ -237,19 +237,33 @@ The output stream is described by an SDP you paste into the controller. It must 
 ```sdp
 v=0
 o=- 1 1 IN IP4 <host-ip>
-s=AES67-tx re-publication
+s=aes67-tx re-publication
 c=IN IP4 239.69.100.1
 t=0 0
 m=audio 5004 RTP/AVP 96
 a=rtpmap:96 L24/48000/2
 a=ptime:1
 a=mediaclk:direct=0
+a=ts-refclk:ptp=IEEE1588-2008:<grandmaster-id>:0
 ```
 
 - Replace `<host-ip>` with the IP of the host running `aes67-tx`.
 - Replace the `c=`, `m=audio` and payload type to match your actual output (`-a`, `-p`, `-t`).
+- **`a=ts-refclk` is not optional on a Dante/AES67 receiver.** It tells the receiver that the RTP
+  media clock is referenced to the PTP grandmaster. Without it the receiver may still show the
+  flow, but packets arrive "Late"/"Early" (red latency bars, muted audio) because it has no
+  mapping from the RTP timestamps to the Dante clock. Use the grandmaster's clock identity in
+  the EUI-64 form `00-1D-C1-FF-FE-01-B0-96` (8 bytes, dashes) followed by the PTP domain
+  (`:0` on this network). Get it from the PTP slave:
 
-Two ready-made examples are in the repository: `example-sdp.txt` (no `ts-refclk`, accepted by most controllers) and `example-sdp-refclk.txt` (adds the PTP reference).
+  ```sh
+  pmc -u -b 0 'GET PARENT_DATA_SET' | grep grandmasterIdentity
+  # grandmasterIdentity 001dc1.fffe.01b096  ->  00-1D-C1-FF-FE-01-B0-96
+  ```
+
+Two ready-made examples are in the repository: `example-sdp-refclk.txt` (with the PTP
+reference; use this for Dante) and `example-sdp.txt` (plain, for controllers that do not need
+`ts-refclk`).
 
 ### Subscribing in Dante Controller
 
@@ -278,8 +292,9 @@ The newly published source is a normal AES67 multicast stream on the output grou
 | Source appears but subscription is refused, or flow is red | The stream is not PTP-synced. Make sure the host is a PTP slave (`portState = SLAVE`) and Sender Reports are being sent (`tcpdump ... port 5005`). |
 | "RTP not enabled on RX device" | Enable AES67 on the receiving device. DVS (Dante Virtual Soundcard) has no AES67 receive — use a hardware Dante/AES67 device. |
 | `ptp4l` stuck in `UNCALIBRATED` | The grandmaster only answers unicast delay requests — add `hybrid_e2e 1` (see above). |
-| Flow is green but **muted**, or no "playing" speaker; latency value jumps on each restart | The media clock is not in lockstep with the grandmaster — likely because the source's timestamps are forwarded instead of re-stamped. Use the default **`--re-stamp`** (ensure you are not passing `--keep-ts`). |
-| Flow is green but no signal on the mixer | The destination (e.g. a MADI/console output) may be inactive, or the AES67 source needs `ts-refclk` to fully lock. Try `example-sdp-refclk.txt`. |
+| Flow is green but **muted**, or no "playing" speaker; latency value jumps on each restart | The media clock is not in lockstep with the grandmaster — likely because the source's timestamps are forwarded instead of re-stamped, or the SDP lacks `a=ts-refclk`. Use the default **`--re-stamp`** and add the PTP reference (see **Example SDP**). |
+| Flow is green but no signal on the mixer | The destination (e.g. a MADI/console output) may be inactive, or the SDP lacks the PTP reference (`a=ts-refclk`). Use `example-sdp-refclk.txt`. |
+| Latency bars red / packets **Late** by many ms | SDP has no `a=ts-refclk`, or a long-running relay's media clock has drifted (relay mode advances the timestamp by the samples in each *received* packet; lost packets accumulate an offset). Add `ts-refclk` and restart that relay service to reseed its media clock. |
 | No audio data / silence | Check the source multicast is flowing (`tcpdump -i eth0 "udp port 5004"`), that you are using the right interface (`-f`), and that the source is not silent. |
 | Sender Report interval too aggressive | `--sr-interval` is in seconds; leave at least 1. |
 
