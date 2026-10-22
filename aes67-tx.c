@@ -66,7 +66,7 @@
 #include <net/if.h>
 
 #define PROGRAM   "aes67-tx"
-#define VERSION   "1.6.1"
+#define VERSION   "1.6.2"
 
 /* POSIX clock number of a PTP hardware clock (PHC), as used by linuxptp.
  * It is the same magic value for every /dev/ptpN; the kernel resolves it to
@@ -700,7 +700,7 @@ int main(int argc, char **argv)
                  * restart (no Liquidsoap reconnect) and the receiver re-locks. */
                 if ((pktcnt % 250) == 0) {
                     long diff = ptp_media_diff(c.rate, ts);
-                    long lim = (long)(0.003 * (double)c.rate);
+                    long lim = (long)(0.002 * (double)c.rate);
                     if (llabs(diff) > lim) {
                         if (++step_bad >= 2) {
                             double ps = phc_sec();
@@ -827,7 +827,7 @@ int main(int argc, char **argv)
              * necessarily PHC-referenced and must not be reseeded). */
             if (c.restamp && (pktcnt % 250) == 0) {
                 long diff = ptp_media_diff(c.rate, lastts);
-                long lim = (long)(0.003 * (double)c.rate);
+                long lim = (long)(0.002 * (double)c.rate);
                 if (llabs(diff) > lim) {
                     if (++step_bad >= 2) {
                         double ps = phc_sec();
