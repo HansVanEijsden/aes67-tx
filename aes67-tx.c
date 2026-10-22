@@ -66,7 +66,7 @@
 #include <net/if.h>
 
 #define PROGRAM   "aes67-tx"
-#define VERSION   "1.6.0"
+#define VERSION   "1.6.1"
 
 /* POSIX clock number of a PTP hardware clock (PHC), as used by linuxptp.
  * It is the same magic value for every /dev/ptpN; the kernel resolves it to
@@ -182,6 +182,23 @@ static double phc_sec(void)
     struct timespec ts;
     if (clock_gettime(PHC_CLOCKID, &ts) != 0) return -1;
     return (double)ts.tv_sec + (double)ts.tv_nsec / 1e9;
+}
+
+/* Difference (in samples) between the current PTP/PHC time and an RTP media
+ * timestamp, wrapped to ±2^31 samples.  The media clock is seeded from the PHC
+ * at startup, so in normal operation this is within about a millisecond.  A
+ * PTP step (grandmaster reboot/reconfiguration) leaves the media clock at the
+ * old offset; the main loops use this value to detect and correct that. */
+static long ptp_media_diff(int rate, uint32_t media_ts)
+{
+    double now = phc_sec();
+    if (now < 0) return 0;
+    double phc_samples = fmod(now * (double)rate, 4294967296.0);
+    double d = phc_samples - (double)media_ts;
+    d = fmod(d, 4294967296.0);
+    if (d > 2147483648.0) d -= 4294967296.0;
+    if (d < -2147483648.0) d += 4294967296.0;
+    return (long)llround(d);
 }
 
 /* resolve an interface name to its IPv4 address (0.0.0.0 if not found). */
@@ -443,6 +460,7 @@ int main(int argc, char **argv)
      * per packet gives a clean, even media clock that is still PTP-referenced via
      * the Sender Reports. */
     uint32_t media_ts = 0;
+    int step_bad = 0;          /* consecutive PTP-step checks above threshold */
 
     if (c.verbose) {
         fprintf(stderr, "%s %s\n", PROGRAM, VERSION);
@@ -671,6 +689,37 @@ int main(int argc, char **argv)
                 seq++; lastts = ts; pktcnt++; octet += packet_bytes;
                 slot++;
 
+                /* PTP-step detection.  The media clock is seeded from the PHC
+                 * once and then advanced by the exact sample count; a PTP step
+                 * (grandmaster reboot/reconfiguration, switch hiccup) leaves it
+                 * at the old offset, which a Dante receiver sees as permanent
+                 * "Late" packets.  Every 250 packets compare the absolute RTP
+                 * timestamp with the PHC; two consecutive checks more than 3 ms
+                 * apart mean a real step, so reseed the media clock in place.
+                 * A short timestamp discontinuity is much better than a service
+                 * restart (no Liquidsoap reconnect) and the receiver re-locks. */
+                if ((pktcnt % 250) == 0) {
+                    long diff = ptp_media_diff(c.rate, ts);
+                    long lim = (long)(0.003 * (double)c.rate);
+                    if (llabs(diff) > lim) {
+                        if (++step_bad >= 2) {
+                            double ps = phc_sec();
+                            if (ps > 0) {
+                                mts_acc = fmod(ps * (double)c.rate, 4294967296.0);
+                                media_ts = (uint32_t)mts_acc;
+                                base_phc = ps;
+                                slot = 0;
+                                step_bad = 0;
+                                fprintf(stderr,
+                                        "PTP step detected (%+.1f ms) - media clock reseeded\n",
+                                        (double)diff * 1000.0 / (double)c.rate);
+                            }
+                        }
+                    } else {
+                        step_bad = 0;
+                    }
+                }
+
                 /* Drop consumed frames, keeping RS_TAPS/2 frames of history for the
                  * sinc interpolator. */
                 double keep = rpos - (double)(RS_TAPS / 2);
@@ -772,6 +821,28 @@ int main(int argc, char **argv)
                 if (c.verbose && errno != EAGAIN) perror("sendto");
             }
             seq++; lastts=ts; pktcnt++; octet += plen;
+
+            /* Same PTP-step detection for the relay path.  Only when we are
+             * re-stamping (--keep-ts means the source's timestamps are not
+             * necessarily PHC-referenced and must not be reseeded). */
+            if (c.restamp && (pktcnt % 250) == 0) {
+                long diff = ptp_media_diff(c.rate, lastts);
+                long lim = (long)(0.003 * (double)c.rate);
+                if (llabs(diff) > lim) {
+                    if (++step_bad >= 2) {
+                        double ps = phc_sec();
+                        if (ps > 0) {
+                            media_ts = (uint32_t)fmod(ps * (double)c.rate, 4294967296.0);
+                            step_bad = 0;
+                            fprintf(stderr,
+                                    "PTP step detected (%+.1f ms) - media clock reseeded\n",
+                                    (double)diff * 1000.0 / (double)c.rate);
+                        }
+                    }
+                } else {
+                    step_bad = 0;
+                }
+            }
 
             time_t now = time(NULL);
             if (c.sr_interval > 0 && now != lastSR) { lastSR = now; send_sr(tx,&txa,ssrc,pktcnt,octet,lastts); }

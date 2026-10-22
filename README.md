@@ -189,6 +189,28 @@ ffmpeg -hide_banner -loglevel error -reconnect 1 -reconnect_streamed 1 -reconnec
   `aes67-tx --raw` exits on upstream EOF so a supervising `systemd` unit (`Restart=always`)
   re-spawns the pipeline for longer drops — together this gives automatic reconnection.
 
+### PTP step detection (v1.6.1)
+
+The media clock is seeded from the PTP hardware clock once and then advanced by exact sample
+counts. That gives a clean, jitter-free clock, but it also means a **PTP step** — a
+grandmaster reboot, a VertoMX/clock reconfiguration or a switch hiccup — would leave the media
+clock at the old offset. A Dante receiver then reports a constant "Late" offset (and may mute
+the channel) until the sender is restarted.
+
+Since **v1.6.1**, both the RTP relay and the `--raw` path check the **absolute** difference
+between the RTP timestamp and the PHC every 250 packets. If two consecutive checks are more
+than **3 ms** apart, the sender logs
+
+```
+PTP step detected (-9.0 ms) - media clock reseeded
+```
+
+and reseeds the media clock in place. The RTP timestamp gets a short discontinuity, but the
+service, the Liquidsoap input and the ASRC buffer keep running; the receiver re-locks within a
+few packets. This is deliberately an in-process correction (no service restart, no stream
+reconnect). `--keep-ts` disables the check, because forwarded source timestamps are not
+necessarily PHC-referenced.
+
 ### Output interface
 
 Set `-f <iface>` to the interface that carries the output multicast (the one wired to the Dante/AES67 switch). If omitted, the kernel picks the default route interface.
@@ -294,7 +316,7 @@ The newly published source is a normal AES67 multicast stream on the output grou
 | `ptp4l` stuck in `UNCALIBRATED` | The grandmaster only answers unicast delay requests — add `hybrid_e2e 1` (see above). |
 | Flow is green but **muted**, or no "playing" speaker; latency value jumps on each restart | The media clock is not in lockstep with the grandmaster — likely because the source's timestamps are forwarded instead of re-stamped, or the SDP lacks `a=ts-refclk`. Use the default **`--re-stamp`** and add the PTP reference (see **Example SDP**). |
 | Flow is green but no signal on the mixer | The destination (e.g. a MADI/console output) may be inactive, or the SDP lacks the PTP reference (`a=ts-refclk`). Use `example-sdp-refclk.txt`. |
-| Latency bars red / packets **Late** by many ms | SDP has no `a=ts-refclk`, or a long-running relay's media clock has drifted (relay mode advances the timestamp by the samples in each *received* packet; lost packets accumulate an offset). Add `ts-refclk` and restart that relay service to reseed its media clock. |
+| Latency bars red / packets **Late** by many ms | SDP has no `a=ts-refclk`, or the sender's media clock is offset after a PTP step. Add `ts-refclk`; v1.6.1 reseeds automatically (log `PTP step detected`), otherwise restart the sender service once. |
 | No audio data / silence | Check the source multicast is flowing (`tcpdump -i eth0 "udp port 5004"`), that you are using the right interface (`-f`), and that the source is not silent. |
 | Sender Report interval too aggressive | `--sr-interval` is in seconds; leave at least 1. |
 
@@ -383,6 +405,9 @@ own once the upstream returns — no watchdog needed there.
 
 ## Version history
 
+- **1.6.1** — automatic **PTP step detection and media-clock reseed** in both relay and
+  `--raw` modes (every 250 packets, >3 ms, two consecutive checks). Prevents the permanent
+  Dante "Late" offset after a grandmaster reboot/reconfiguration.
 - **1.6.0** — `--raw` now has a **32-tap windowed-sinc adaptive resampler** with a PI
   controller on the input ring fill (`-L` target latency, `-J` capacity). This removes the
   growing latency / zero-packet hiccups seen when a remote FLAC encoder's clock drifts
