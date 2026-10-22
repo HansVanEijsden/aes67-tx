@@ -66,7 +66,7 @@
 #include <net/if.h>
 
 #define PROGRAM   "aes67-tx"
-#define VERSION   "1.5.0"
+#define VERSION   "1.6.0"
 
 /* POSIX clock number of a PTP hardware clock (PHC), as used by linuxptp.
  * It is the same magic value for every /dev/ptpN; the kernel resolves it to
@@ -96,7 +96,10 @@ typedef struct {
     int    bitdepth;         /* PCM bits per sample (16/24)      */
     int    channels;         /* number of channels               */
     int    pkt;              /* samples (frames) per RTP packet  */
-    int    jbuf;             /* jitter-buffer depth, in packets  */
+    int    jbuf;             /* raw input ring capacity, in packets */
+    int    latency_ms;       /* target buffer latency for --raw (ms); 0 = auto
+                                (half of the -J capacity).  The adaptive resampler
+                                holds the input buffer at this fill level. */
     int    verbose;          /* log progress                     */
 } cfg_t;
 
@@ -136,9 +139,14 @@ static void usage(const char *prog)
         "  -b, --bit <16|24>         PCM bits per sample for --raw    (default 24)\n"
         "  -C, --channels <n>        channels for --raw               (default 2)\n"
         "  -n, --pkt <frames>        frames per RTP packet for --raw  (default 48 = 1 ms)\n"
-        "  -J, --jitter <pkts>       jitter-buffer depth for --raw    (default 32;\n"
-        "                            read-ahead this many packets and emit one per media\n"
-        "                            slot, smoothing bursts/gaps from the upstream)\n"
+        "  -J, --jitter <pkts>       input ring capacity for --raw   (default 32;\n"
+        "                            total buffering capacity in packets.  Use a large\n"
+        "                            value for internet sources, e.g. -J 4096 = ~4 s)\n"
+        "  -L, --latency <ms>        target buffer latency for --raw  (default 0 =\n"
+        "                            half of the -J capacity).  The adaptive resampler\n"
+        "                            locks the input buffer at this fill level, so clock\n"
+        "                            drift and network jitter never accumulate into\n"
+        "                            growing latency or hiccups.\n"
         "\n"
         "Other\n"
         "  -v, --verbose             log progress to stderr\n"
@@ -214,6 +222,91 @@ static void send_sr(int tx, struct sockaddr_in *txa, uint32_t ssrc,
     sendto(tx, sr, 28, 0, (struct sockaddr *)&ra, sizeof(ra));
 }
 
+/* --- adaptive windowed-sinc resampler for --raw -------------------------
+ *
+ * The input is a free-running PCM stream: its sample rate is set by the
+ * *remote* encoder's clock, not by our PTP clock.  Even a perfect 48 kHz
+ * FLAC stream therefore drifts a few ppm against the grandmaster.  Feeding
+ * that fixed-rate content to a PTP-paced output makes the input ring slowly
+ * fill (growing latency) or empty (zero-packet hiccups).
+ *
+ * We hold the ring at a fixed target fill and continuously adapt the
+ * resampling ratio with a slow PI controller.  A 32-tap Kaiser-windowed sinc
+ * keeps the audio quality high; the ratio only changes by ppm, so pitch
+ * modulation is inaudible.  The output itself stays exactly PTP-paced.
+ */
+#define RS_TAPS   32
+#define RS_PHASES 1024
+#define RS_BETA   8.0
+static double rs_coef[RS_PHASES][RS_TAPS];
+
+static double bessel_i0(double x)
+{
+    double sum = 1.0, term = 1.0;
+    for (int k = 1; k < 30; k++) {
+        term *= (x / (2.0 * k)) * (x / (2.0 * k));
+        sum += term;
+        if (term < 1e-12 * sum) break;
+    }
+    return sum;
+}
+
+static void rs_init(void)
+{
+    static int done = 0;
+    if (done) return;
+    done = 1;
+    double i0b = bessel_i0(RS_BETA);
+    for (int p = 0; p < RS_PHASES; p++) {
+        double frac = (double)p / (double)RS_PHASES;
+        double sum = 0.0;
+        for (int t = 0; t < RS_TAPS; t++) {
+            double x = (double)t - (double)(RS_TAPS / 2 - 1) - frac;
+            double s = fabs(x) < 1e-12 ? 1.0 : sin(M_PI * x) / (M_PI * x);
+            double r = ((double)t - (double)(RS_TAPS - 1) / 2.0) /
+                       ((double)(RS_TAPS - 1) / 2.0);
+            double w = 0.0;
+            if (fabs(r) <= 1.0) w = bessel_i0(RS_BETA * sqrt(1.0 - r * r)) / i0b;
+            rs_coef[p][t] = s * w;
+            sum += rs_coef[p][t];
+        }
+        if (fabs(sum) > 1e-12)
+            for (int t = 0; t < RS_TAPS; t++) rs_coef[p][t] /= sum;
+    }
+}
+
+/* Interpolate one output sample from the interleaved source buffer at
+ * fractional source position `pos`.  Out-of-range taps are clamped to the
+ * buffer edges; the pre-fill/target logic keeps this path off the edges in
+ * normal operation. */
+static int32_t rs_sample(const int32_t *sb, size_t slen, int nch, int ch, double pos)
+{
+    if (slen < RS_TAPS + 2) return 0;
+    long fi = (long)floor(pos);
+    double frac = pos - (double)fi;
+    long base = fi - (RS_TAPS / 2 - 1);
+    double ph = frac * (double)RS_PHASES;
+    int p0 = (int)ph;
+    if (p0 < 0) p0 = 0;
+    if (p0 >= RS_PHASES) p0 = RS_PHASES - 1;
+    int p1 = (p0 + 1) % RS_PHASES;
+    double pf = ph - floor(ph);
+    double acc = 0.0;
+    for (int t = 0; t < RS_TAPS; t++) {
+        long idx = base + t;
+        int32_t s;
+        if (idx < 0) s = sb[ch];
+        else if ((size_t)idx >= slen) s = sb[(slen - 1) * (size_t)nch + (size_t)ch];
+        else s = sb[(size_t)idx * (size_t)nch + (size_t)ch];
+        double coef = rs_coef[p0][t] * (1.0 - pf) + rs_coef[p1][t] * pf;
+        acc += coef * (double)s;
+    }
+    long v = lrint(acc);
+    if (v > 0x7fffff) v = 0x7fffff;
+    if (v < -0x800000) v = -0x800000;
+    return (int32_t)v;
+}
+
 int main(int argc, char **argv)
 {
     cfg_t c;
@@ -221,7 +314,8 @@ int main(int argc, char **argv)
     c.in_port = 5004; c.out_port = 5004; c.pt = 96; c.ttl = 8;
     c.sr_interval = 1; c.ssrc = 0; c.rate = 48000; c.iface[0] = 0;
     c.bitdepth = 24; c.channels = 2; c.pkt = 48; c.raw = 0;
-    c.jbuf = 32;   /* jitter-buffer depth (packets) for --raw; ~32 ms at 48k/48 */
+    c.jbuf = 32;   /* raw input ring capacity (packets); ~32 ms at 48k/48 */
+    c.latency_ms = 0;   /* target buffer latency (ms); 0 = auto = half of jbuf */
     /* Default: re-stamp from the PTP clock. A non-PTP source (e.g. Stereo Tool)
      * uses the system clock, so forwarding its timestamps is not in lockstep
      * with the grandmaster and Dante keeps the channel muted. Re-stamping from
@@ -251,12 +345,13 @@ int main(int argc, char **argv)
         {"channels",     required_argument, 0, 'C'},
         {"pkt",          required_argument, 0, 'n'},
         {"jitter",       required_argument, 0, 'J'},
+        {"latency",      required_argument, 0, 'L'},
         {"verbose",      no_argument,       0, 'v'},
         {"help",         no_argument,       0, 'h'},
         {0,0,0,0}
     };
     int copt;
-    while ((copt = getopt_long(argc, argv, "A:P:S:a:p:k:t:l:f:d:r:RB:KWb:C:n:J:vh", opts, NULL)) != -1) {
+    while ((copt = getopt_long(argc, argv, "A:P:S:a:p:k:t:l:f:d:r:RB:KWb:C:n:J:L:vh", opts, NULL)) != -1) {
         switch (copt) {
         case 'A': snprintf(c.in_addr, 64, "%s", optarg); break;
         case 'P': c.in_port = atoi(optarg); break;
@@ -279,6 +374,7 @@ int main(int argc, char **argv)
         case 'C': c.channels = atoi(optarg); break;
         case 'n': c.pkt = atoi(optarg); break;
         case 'J': c.jbuf = atoi(optarg); break;
+        case 'L': c.latency_ms = atoi(optarg); break;
         case 'v': c.verbose = 1; break;
         case 'h': usage(argv[0]); return 0;
         default : usage(argv[0]); return 1;
@@ -410,19 +506,47 @@ int main(int argc, char **argv)
         int f_orig = fcntl(0, F_GETFL, 0);
         fcntl(0, F_SETFL, f_orig | O_NONBLOCK);
 
-        /* --- resampler source buffer: interleaved 32-bit frames --- */
+        /* --- adaptive resampler: interleaved 32-bit source frames --- */
         size_t cap = (size_t)(jb + 8) * (size_t)c.pkt + (size_t)c.pkt + 8;
         int32_t *sb  = malloc(cap * (size_t)nch * sizeof *sb);
         unsigned char *ib = malloc((size_t)packet_bytes + 16);
         size_t slen = 0, igot = 0;                 /* buffered frames / undecoded bytes */
         int eof = 0;
 
-        /* pre-fill a jitter-buffer of frames before the first emit, and ensure the
-         * resampler has enough lookahead to interpolate the first packet */
-        while (slen < (size_t)jb * (size_t)c.pkt && !eof) {
+        /* Target fill of the input ring.  Everything between the source and the
+         * PTP-paced output is absorbed here: network jitter, decoder bursts and
+         * the remote encoder's clock drift.  The PI controller below keeps this
+         * fill constant by very slowly changing the resampling ratio. */
+        int target_ms = c.latency_ms > 0
+                            ? c.latency_ms
+                            : (int)((long long)jb * c.pkt * 1000 / (2 * c.rate));
+        if (target_ms < 20) target_ms = 20;
+        size_t target_frames = (size_t)((double)target_ms * (double)c.rate / 1000.0);
+        size_t margin = (size_t)(RS_TAPS + 2 * c.pkt);
+        if (target_frames < margin) target_frames = margin;
+        if (target_frames + margin > cap) target_frames = cap - margin;
+        rs_init();
+
+        /* Pre-fill to the target (+ resampler lookahead) before the first emit.
+         * A bigger target means a slower start but a much more robust stream;
+         * the service uses -L 1500 -J 4096 (~1.5 s target, 4 s capacity). */
+        size_t prefill = target_frames + margin;
+        if (prefill > cap) prefill = cap;
+        int stall = 0;
+        while (slen < prefill && !eof && !g_stop) {
             int r = (int)read(0, ib + igot, (size_t)packet_bytes - igot);
-            if (r < 0) { if (errno == EINTR) continue; if (errno == EAGAIN) break; eof = 1; break; }
+            if (r < 0) {
+                if (errno == EINTR) continue;
+                if (errno == EAGAIN) {
+                    if (++stall > 5000) break;      /* ~10 s without any input */
+                    usleep(2000);
+                    continue;
+                }
+                eof = 1;
+                break;
+            }
             if (r == 0) { eof = 1; break; }
+            stall = 0;
             igot += (size_t)r;
             while (igot >= (size_t)bytes_per_frame && slen < cap) {
                 unsigned char *f = ib;
@@ -443,8 +567,11 @@ int main(int argc, char **argv)
         double base_s = nowt.tv_sec + nowt.tv_nsec / 1e9;
         double base_phc = phc_sec(); if (base_phc < 0) base_phc = base_s;
         uint64_t slot = 0;
-        double rpos = 0.0;                          /* source-frame position (fractional) */
+        /* Start a little into the buffer so the sinc has preceding taps. */
+        double rpos = (double)(RS_TAPS / 2);        /* source-frame position (fractional) */
         double mts_acc = 0.0;                       /* fractional, PHC-seeded media clock */
+        double corr_i = 0.0;                        /* integral part of the PI controller */
+        unsigned long long underruns = 0;
 
         while (!g_stop) {
             /* pace each media-clock slot against the PHC (the grandmaster) so the media
@@ -454,7 +581,6 @@ int main(int argc, char **argv)
             double now_s = nowt.tv_sec + nowt.tv_nsec / 1e9;
             double phc_now = phc_sec(); if (phc_now < 0) phc_now = base_phc;
             double target_phc = base_phc + (double)slot * pkt_period;
-            size_t need = (size_t)rpos + (size_t)c.pkt + 1;
 
             if (slen == 0 && eof) {
                 if (c.verbose) fprintf(stderr, "input EOF (upstream stopped) - exiting so systemd restarts\n");
@@ -484,50 +610,75 @@ int main(int argc, char **argv)
                 /* The media clock advances by the exact sample count per packet, and the
                  * emit itself is paced at the PHC (grandmaster) slots above, so the rate is
                  * the grandmaster rate automatically — no measured-rate bias, even clock. */
-                if (mts_acc == 0.0) { double s0 = phc_sec(); if (s0 < 0) s0 = 0; mts_acc = fmod(s0 * (double)c.rate, 4294967296.0); }
+                if (mts_acc == 0.0) {
+                    double s0 = phc_sec(); if (s0 < 0) s0 = 0;
+                    mts_acc = fmod(s0 * (double)c.rate, 4294967296.0);
+                }
                 double mts_delta = (double)c.pkt;
                 mts_acc += mts_delta;
-                double cstep = 1.0;                                             /* source frames per output frame */
+
+                /* PI controller: compare the input ring fill with the target and
+                 * slowly adapt the resampling ratio.  Positive error (buffer too
+                 * full) -> consume slightly more source frames per output frame,
+                 * so the buffer drains back to target.  This compensates both the
+                 * remote encoder's clock drift and any PTP/system rate offset. */
+                double fill = (double)slen - rpos;
+                double err = (fill - (double)target_frames) / (double)target_frames;
+                double dt = (double)c.pkt / (double)c.rate;
+                corr_i += 5e-4 * err * dt;
+                if (corr_i > 0.01) corr_i = 0.01;
+                if (corr_i < -0.01) corr_i = -0.01;
+                double corr = 2e-4 * err + corr_i;
+                if (corr > 0.01) corr = 0.01;
+                if (corr < -0.01) corr = -0.01;
+                double cstep = 1.0 + corr;              /* source frames per output frame */
+
                 uint32_t ts = (uint32_t)mts_acc;
                 media_ts = ts;
                 out[0]=0x80; out[1]=(unsigned char)(c.pt & 0x7f);
                 out[2]=(seq>>8)&0xff; out[3]=seq&0xff;
                 out[4]=(ts>>24)&0xff; out[5]=(ts>>16)&0xff; out[6]=(ts>>8)&0xff; out[7]=ts&0xff;
                 out[8]=(ssrc>>24)&0xff; out[9]=(ssrc>>16)&0xff; out[10]=(ssrc>>8)&0xff; out[11]=ssrc&0xff;
-                if (slen > need) {
-                    /* Resample: linear interp at the fractional source position, so the
-                     * emitted (grandmaster-rate) content back-annotates the system-rate
-                     * decoder cleanly.  AES67 L24 is big-endian. */
+
+                long base = (long)floor(rpos + (double)(c.pkt - 1) * cstep)
+                            - (RS_TAPS / 2 - 1);
+                if (base < 0) base = 0;
+                size_t need = (size_t)base + RS_TAPS + 1;
+                int have = (slen >= need &&
+                            fill > (double)c.pkt * cstep + (double)RS_TAPS + 2.0);
+                if (have) {
                     for (int k = 0; k < c.pkt; k++) {
                         double fpos = rpos + (double)k * cstep;
-                        size_t fi = (size_t)fpos;
-                        double frac = fpos - (double)fi;
                         for (int ch = 0; ch < nch; ch++) {
-                            double a = (double)sb[fi * nch + ch];
-                            double b = (double)sb[(fi + 1) * nch + ch];
-                            int v = (int)(a + (b - a) * frac);
-                            if (v > 0x7fffff) v = 0x7fffff; else if (v < -0x800000) v = -0x800000;
-                            size_t o = 12 + ((size_t)k * nch + (size_t)ch) * (size_t)bps;
+                            int32_t v = rs_sample(sb, slen, nch, ch, fpos);
+                            size_t o = 12 + ((size_t)k * (size_t)nch + (size_t)ch) * (size_t)bps;
                             out[o]     = (unsigned char)((v >> 16) & 0xff);
                             out[o + 1] = (unsigned char)((v >> 8)  & 0xff);
                             out[o + 2] = (unsigned char)( v        & 0xff);
                         }
                     }
-                    rpos += mts_delta;               /* advance content with the media clock */
+                    rpos += (double)c.pkt * cstep;
                 } else {
-                    /* upstream underrun: emit a zero packet, and skip the source position
-                     * forward so the media clock never falls behind the grandmaster */
+                    /* Upstream underrun: keep the PTP media clock running with a
+                     * zero packet and advance the source position, so a stall never
+                     * turns into permanently growing latency. */
                     for (int k = 0; k < c.pkt * nch * bps; k++) out[12 + k] = 0;
-                    rpos += mts_delta;
-                    if ((size_t)rpos > slen) rpos = (double)slen;
+                    underruns++;
+                    rpos += (double)c.pkt;
+                    if (rpos > (double)slen) rpos = (double)slen;
                 }
                 sendto(tx, out, 12 + packet_bytes, 0, (struct sockaddr *)&txa, sizeof txa);
                 seq++; lastts = ts; pktcnt++; octet += packet_bytes;
                 slot++;
-                /* drop consumed frames from the front of the buffer */
-                if ((size_t)rpos > 1024) {
-                    size_t drop = (size_t)rpos;
-                    memmove(sb, sb + drop * nch, (slen - drop) * nch * sizeof *sb);
+
+                /* Drop consumed frames, keeping RS_TAPS/2 frames of history for the
+                 * sinc interpolator. */
+                double keep = rpos - (double)(RS_TAPS / 2);
+                if (keep > 0.0) {
+                    size_t drop = (size_t)keep;
+                    if (drop > slen) drop = slen;
+                    memmove(sb, sb + drop * (size_t)nch,
+                            (slen - drop) * (size_t)nch * sizeof *sb);
                     slen -= drop;
                     rpos -= (double)drop;
                 }
@@ -540,8 +691,12 @@ int main(int argc, char **argv)
                         double off = phcts - (double)ts;
                         if (off > 2147483648.0) off -= 4294967296.0;
                         if (off < -2147483648.0) off += 4294967296.0;
-                        fprintf(stderr, "seq=%u ts=%u pkt=%llu offset_sample=%+.0f (%+.3f ms)\n",
-                                seq, ts, (unsigned long long)pktcnt, off, off / (double)c.rate * 1000.0);
+                        fprintf(stderr, "seq=%u ts=%u pkt=%llu fill=%.1fms target=%.1fms corr=%+.1fppm underruns=%llu offset_sample=%+.0f (%+.3f ms)\n",
+                                seq, ts, (unsigned long long)pktcnt,
+                                fill / (double)c.rate * 1000.0,
+                                (double)target_frames / (double)c.rate * 1000.0,
+                                corr * 1e6, underruns,
+                                off, off / (double)c.rate * 1000.0);
                     }
                 }
             }

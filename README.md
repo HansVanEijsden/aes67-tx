@@ -117,7 +117,8 @@ sudo ./aes67-tx \
 -b, --bit <16|24>          PCM bits per sample for --raw      (default 24)
 -C, --channels <n>         channels for --raw                 (default 2)
 -n, --pkt <frames>         frames per RTP packet for --raw    (default 48 = 1 ms)
--J, --jitter <pkts>        jitter-buffer depth for --raw      (default 32 = 32 ms)
+-J, --jitter <pkts>        input ring capacity for --raw      (default 32 = 32 ms)
+-L, --latency <ms>         target buffer latency for --raw   (default 0 = half of -J)
 -v, --verbose              log progress to stderr
 -h, --help                 show help
 ```
@@ -141,33 +142,52 @@ This is the part that makes or breaks a Dante/AES67 receiver accepting the strea
 ### Feeding it a non-RTP source (--raw)
 
 Use `--raw` when your audio is not already on RTP/AES67 — e.g. a network IceCast/FLAC
-stream, a file, or a sound card. It reads raw interleaved PCM from **stdin** and packetises
-it as AES67, re-stamping every packet from the PTP clock. Combine it with a decoder that
-produces PCM at the session rate, e.g.:
+stream, a file, or a sound card. It reads raw interleaved PCM from **stdin**, packetises it
+as AES67 and re-stamps every packet from the PTP clock.
+
+The recommended front-end is Liquidsoap, because it reconnects the HTTP input, decodes
+Ogg/FLAC losslessly and can feed `aes67-tx` raw 24-bit PCM without an intermediate file:
+
+```liquidsoap
+s = mksafe(input.http("https://radio.example.org/station-flac",
+                      max_buffer=0.5, self_sync=false))
+output.external(
+  %wav(header=false, samplerate=48000, channels=2, samplesize=24),
+  "/usr/local/bin/aes67-tx --raw -k 0x6a95A511 -a 239.69.100.2 -p 5004 \
+     -f eno1 -b 24 -C 2 -n 48 -J 3072 -L 1000 -t 96 -l 8",
+  s, self_sync=true)
+```
+
+A pipe from `ffmpeg` works too (ffmpeg scales 16-bit audio to 24-bit automatically):
 
 ```sh
-# 16-bit source -> ffmpeg scales it to 24-bit automatically when you output s24le
 ffmpeg -hide_banner -loglevel error -reconnect 1 -reconnect_streamed 1 -reconnect_delay_max 5 \
   -i "https://example.org/station" -vn -f s24le -ar 48000 -ac 2 - \
-  | aes67-tx --raw -a 239.69.100.2 -p 5004 -f eth0 -b 24 -C 2 -n 48 -v
+  | aes67-tx --raw -a 239.69.100.2 -p 5004 -f eth0 -b 24 -C 2 -n 48 -J 3072 -L 1000 -v
 ```
 
 - `-b 16`/`-b 24` set the PCM width; the AES67 payload becomes `L16`/`L24` accordingly.
 - **AES67 L16/L24 are big-endian**; `aes67-tx --raw` byte-swaps the little-endian PCM it
-  reads (from ffmpeg) to the big-endian RTP payload automatically.
+  reads to the big-endian RTP payload automatically.
 - **A PCM24 receiver (many Dante bridges) rejects `L16` flows.** If your device is configured
-  for 24-bit, output `L24`. When you decode a 16-bit source and write `-f s24le`, ffmpeg
-  scales the 16-bit to 24-bit itself, so no extra gain filter is needed.
+  for 24-bit, output `L24`. When you decode a 16-bit source and write `s24le`, ffmpeg scales
+  the 16-bit to 24-bit itself, so no extra gain filter is needed (Liquidsoap's
+  `%wav(..., samplesize=24)` does the same).
 - `-n 48` = 48 frames/packet (≈1 ms at 48 kHz). Keep the SDP's `a=ptime` in agreement.
-- `-J <N>` = jitter-buffer depth in packets. A live decoder (network FLAC/Ogg) delivers data
-  in bursts and gaps; `aes67-tx --raw` reads ahead `N` packets from stdin into a ring and
-  emits one packet per media-clock slot, so the receiver sees an even pace instead of the
-  upstream bursts (which overflow an AES67 receiver's jitter buffer — "Late" spikes / link
-  drops). Default 32 (≈32 ms at 48 kHz / 48-frame packets); raise it (e.g. `-J 256`) if your
-  uplink can stall for longer — the cost is that much added latency.
-- `ffmpeg -reconnect ...` reconnects over short outages; `aes67-tx --raw` exits on upstream
-  EOF so a supervising `systemd` unit (`Restart=always`) re-spawns the pipeline for longer
-  drops — together this gives automatic reconnection.
+- **`-J <N>`** is the input ring *capacity* in packets (default 32 = 32 ms). Use a large
+  capacity for an internet source, e.g. `-J 3072` ≈ 3 s or `-J 4096` ≈ 4 s.
+- **`-L <ms>`** is the target buffer latency (default 0 = half of the `-J` capacity). This is
+  the crucial setting for a non-PTP source: the input clock runs on the remote encoder's
+  crystal, which drifts a few ppm against the Dante/PTP grandmaster. A fixed-rate pipe would
+  slowly fill (growing latency) or empty (zero-packet hiccups). Since **v1.6.0**, `--raw`
+  uses a **32-tap windowed-sinc adaptive resampler**: a slow PI controller watches the ring
+  fill and continuously adjusts the resampling ratio to hold it at the `-L` target. The
+  output itself is still PTP-paced, so the receiver stays locked and the latency stays flat.
+  A target of 1000–1500 ms is a good compromise for an internet feed; raise `-L`/`-J` for a
+  more forgiving uplink, lower them for less latency.
+- `ffmpeg -reconnect ...` (or Liquidsoap's `input.http`) reconnects over short outages;
+  `aes67-tx --raw` exits on upstream EOF so a supervising `systemd` unit (`Restart=always`)
+  re-spawns the pipeline for longer drops — together this gives automatic reconnection.
 
 ### Output interface
 
@@ -272,10 +292,11 @@ simultaneously on one host, each on its own multicast group:
 
 - `examples/aes67-1zwolle-hd.service` — re-publishes a source AES67/RTP stream (a broadcast
   processor / LiveWire) as **L24** AES67 on `239.69.100.1`.
-- `examples/aes67-salland1-hd.service` — decodes a network IceCast/FLAC stream with ffmpeg,
-  scales the 16-bit source to 24-bit and publishes it as **L24** AES67 on `239.69.100.2`
-  (handy when the studio can't yet send AES67/Dante directly), with automatic reconnection on
-  internet drops.
+- `examples/aes67-salland1-hd.service` + `examples/liquidsoap-aes67-salland1.liq` — Liquidsoap
+  fetches and decodes a network IceCast/FLAC stream, then feeds `aes67-tx --raw` as **L24**
+  AES67 on `239.69.100.2`, with adaptive resampling (target 1 s, 3 s ring) so clock drift and
+  network jitter never accumulate. The same flow/SSRC/SDP is reused, so an existing Dante
+  Controller subscription needs no change.
 
 Each channel uses its own output group and its own SDP: `example-sdp.txt` (L24) and
 `example-sdp-salland1.txt` (L24, from a 16-bit source). Install and start them with:
@@ -320,10 +341,10 @@ and the source flows also wait on `network-online.target`.
 
 ### Keep a decoded-network stream producing (`aes67-stream-watchdog`)
 
-`ffmpeg -reconnect` recovers from a network EOF, but on a **decoder/CRC error** it can
-*hang* instead of reconnecting — leaving `aes67-tx --raw` with an empty pipe and `0`
-packets out. `systemd Restart=always` only re-spawns when the process *exits*; a hung
-`ffmpeg` never exits. The included **`aes67-stream-watchdog`** fixes this:
+A decoder can *hang* on a network/decoder error instead of reconnecting — leaving
+`aes67-tx --raw` with an empty pipe and `0` packets out. `systemd Restart=always` only
+re-spawns when the process *exits*; a hung Liquidsoap/ffmpeg never exits. The included
+**`aes67-stream-watchdog`** fixes that:
 
 ```sh
 sudo cp aes67-stream-watchdog.sh /usr/local/bin/ && sudo chmod +x /usr/local/bin/aes67-stream-watchdog.sh
@@ -333,15 +354,32 @@ sudo systemctl enable --now aes67-stream-watchdog
 ```
 
 It watches the output multicast group (`239.69.100.2`, edit in the script) and, if it
-stays silent for ~24 s (hung `ffmpeg`, network/switch drop, stream error — anything),
-restarts `aes67-salland1-hd.service`, which kills the stuck pipeline and re-spawns so
-`ffmpeg` reconnects. It stays quiet while the stream is healthy and recovers automatically
-after any drop. Tune `DST`/`PORT`/`CAPTURE`/`BAD_LIMIT` in `aes67-stream-watchdog.sh` for
-other groups or a different silence threshold.
+stays silent for ~24 s (hung decoder, network/switch drop, stream error — anything),
+restarts `aes67-salland1-hd.service`, which kills the stuck pipeline and re-spawns it.
+It stays quiet while the stream is healthy and recovers automatically after any drop.
+Tune `DST`/`PORT`/`CAPTURE`/`BAD_LIMIT` in `aes67-stream-watchdog.sh` for other groups or
+a different silence threshold.
 
 A source that is merely forwarded as AES67/RTP (e.g. `aes67-1zwolle-hd`) does not have this
-`ffmpeg` failure mode: it re-publishes whatever arrives, so the source flow recovers on its
+`decoder` failure mode: it re-publishes whatever arrives, so the source flow recovers on its
 own once the upstream returns — no watchdog needed there.
+
+---
+
+## Version history
+
+- **1.6.0** — `--raw` now has a **32-tap windowed-sinc adaptive resampler** with a PI
+  controller on the input ring fill (`-L` target latency, `-J` capacity). This removes the
+  growing latency / zero-packet hiccups seen when a remote FLAC encoder's clock drifts
+  against the PTP grandmaster. `-L` now means *target buffer latency*; `-J` means ring
+  *capacity*. Liquidsoap front-end example added; the Salland1 service uses it on the
+  existing flow/SSRC/SDP.
+- **1.5.0** — media-clock pacing on the PHC plus a fixed-ratio fractional resampler for the
+  grandmaster-vs-system rate; exact sample-count stamping.
+- **1.4.1** — pace the media clock against the PTP rate (`phc_rate`), not the system clock.
+- **1.4.0** — seed the media clock once from the PHC and advance by exact sample counts
+  (removes RTP-timestamp jitter / ragged distortion).
+- **1.2.3** — steady media-clock packet pacing for bursty raw upstreams.
 
 ---
 
