@@ -13,6 +13,6 @@ s = mksafe(input.http("https://radio.salland1.nl/salland1-flac",
 # and the adaptive resampling; target 1.0 s, 3 s ring capacity.
 output.external(
   %wav(header=false, samplerate=48000, channels=2, samplesize=24),
-  "/usr/local/bin/aes67-tx --raw -k 0x6a95A511 -a 239.69.100.2 -p 5004 -f eno1 -b 24 -C 2 -n 48 -J 3072 -L 1000 -t 96 -l 8 -v",
+  "/usr/local/bin/aes67-tx --raw -k 0x6a95A511 -a 239.69.100.2 -p 5004 -f eno1 -b 24 -C 2 -n 48 -J 3072 -L 1000 -U 10 -t 96 -l 8 -v",
   s,
   self_sync=true)

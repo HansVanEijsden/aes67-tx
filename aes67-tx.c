@@ -66,7 +66,7 @@
 #include <net/if.h>
 
 #define PROGRAM   "aes67-tx"
-#define VERSION   "1.6.2"
+#define VERSION   "1.6.3"
 
 /* POSIX clock number of a PTP hardware clock (PHC), as used by linuxptp.
  * It is the same magic value for every /dev/ptpN; the kernel resolves it to
@@ -100,6 +100,7 @@ typedef struct {
     int    latency_ms;       /* target buffer latency for --raw (ms); 0 = auto
                                 (half of the -J capacity).  The adaptive resampler
                                 holds the input buffer at this fill level. */
+    int    underrun_exit;    /* exit after N seconds of raw underrun (0=off) */
     int    verbose;          /* log progress                     */
 } cfg_t;
 
@@ -147,6 +148,9 @@ static void usage(const char *prog)
         "                            locks the input buffer at this fill level, so clock\n"
         "                            drift and network jitter never accumulate into\n"
         "                            growing latency or hiccups.\n"
+        "  -U, --underrun-exit <s>   exit after N seconds of raw-buffer underrun\n"
+        "                            (default 0 = off).  Use ~10 so systemd restarts\n"
+        "                            the pipeline if the decoder stops delivering PCM.\n"
         "\n"
         "Other\n"
         "  -v, --verbose             log progress to stderr\n"
@@ -333,6 +337,7 @@ int main(int argc, char **argv)
     c.bitdepth = 24; c.channels = 2; c.pkt = 48; c.raw = 0;
     c.jbuf = 32;   /* raw input ring capacity (packets); ~32 ms at 48k/48 */
     c.latency_ms = 0;   /* target buffer latency (ms); 0 = auto = half of jbuf */
+    c.underrun_exit = 0; /* 0 = disabled; set via -U for internet-fed pipelines */
     /* Default: re-stamp from the PTP clock. A non-PTP source (e.g. Stereo Tool)
      * uses the system clock, so forwarding its timestamps is not in lockstep
      * with the grandmaster and Dante keeps the channel muted. Re-stamping from
@@ -363,12 +368,13 @@ int main(int argc, char **argv)
         {"pkt",          required_argument, 0, 'n'},
         {"jitter",       required_argument, 0, 'J'},
         {"latency",      required_argument, 0, 'L'},
+        {"underrun-exit", required_argument, 0, 'U'},
         {"verbose",      no_argument,       0, 'v'},
         {"help",         no_argument,       0, 'h'},
         {0,0,0,0}
     };
     int copt;
-    while ((copt = getopt_long(argc, argv, "A:P:S:a:p:k:t:l:f:d:r:RB:KWb:C:n:J:L:vh", opts, NULL)) != -1) {
+    while ((copt = getopt_long(argc, argv, "A:P:S:a:p:k:t:l:f:d:r:RB:KWb:C:n:J:L:U:vh", opts, NULL)) != -1) {
         switch (copt) {
         case 'A': snprintf(c.in_addr, 64, "%s", optarg); break;
         case 'P': c.in_port = atoi(optarg); break;
@@ -392,6 +398,7 @@ int main(int argc, char **argv)
         case 'n': c.pkt = atoi(optarg); break;
         case 'J': c.jbuf = atoi(optarg); break;
         case 'L': c.latency_ms = atoi(optarg); break;
+        case 'U': c.underrun_exit = atoi(optarg); break;
         case 'v': c.verbose = 1; break;
         case 'h': usage(argv[0]); return 0;
         default : usage(argv[0]); return 1;
@@ -590,6 +597,7 @@ int main(int argc, char **argv)
         double mts_acc = 0.0;                       /* fractional, PHC-seeded media clock */
         double corr_i = 0.0;                        /* integral part of the PI controller */
         unsigned long long underruns = 0;
+        time_t underrun_since = 0;
 
         while (!g_stop) {
             /* pace each media-clock slot against the PHC (the grandmaster) so the media
@@ -676,12 +684,23 @@ int main(int argc, char **argv)
                         }
                     }
                     rpos += (double)c.pkt * cstep;
+                    underrun_since = 0;
                 } else {
                     /* Upstream underrun: keep the PTP media clock running with a
                      * zero packet and advance the source position, so a stall never
                      * turns into permanently growing latency. */
                     for (int k = 0; k < c.pkt * nch * bps; k++) out[12 + k] = 0;
                     underruns++;
+                    if (c.underrun_exit > 0) {
+                        time_t now_ur = time(NULL);
+                        if (underrun_since == 0) underrun_since = now_ur;
+                        else if (now_ur - underrun_since >= c.underrun_exit) {
+                            fprintf(stderr,
+                                    "raw input underrun for %d s - exiting so systemd restarts the pipeline\n",
+                                    c.underrun_exit);
+                            g_stop = 1;
+                        }
+                    }
                     rpos += (double)c.pkt;
                     if (rpos > (double)slen) rpos = (double)slen;
                 }
