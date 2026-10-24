@@ -66,7 +66,7 @@
 #include <net/if.h>
 
 #define PROGRAM   "aes67-tx"
-#define VERSION   "1.6.3"
+#define VERSION   "1.7.0"
 
 /* POSIX clock number of a PTP hardware clock (PHC), as used by linuxptp.
  * It is the same magic value for every /dev/ptpN; the kernel resolves it to
@@ -466,8 +466,6 @@ int main(int argc, char **argv)
      * receiver.  Seeding once from the PHC and advancing by the exact sample count
      * per packet gives a clean, even media clock that is still PTP-referenced via
      * the Sender Reports. */
-    uint32_t media_ts = 0;
-    int step_bad = 0;          /* consecutive PTP-step checks above threshold */
 
     if (c.verbose) {
         fprintf(stderr, "%s %s\n", PROGRAM, VERSION);
@@ -595,6 +593,7 @@ int main(int argc, char **argv)
         /* Start a little into the buffer so the sinc has preceding taps. */
         double rpos = (double)(RS_TAPS / 2);        /* source-frame position (fractional) */
         double mts_acc = 0.0;                       /* fractional, PHC-seeded media clock */
+        double mts_slew = 0.0;                      /* PLL: extra samples per output packet */
         double corr_i = 0.0;                        /* integral part of the PI controller */
         unsigned long long underruns = 0;
         time_t underrun_since = 0;
@@ -641,7 +640,7 @@ int main(int argc, char **argv)
                     mts_acc = fmod(s0 * (double)c.rate, 4294967296.0);
                 }
                 double mts_delta = (double)c.pkt;
-                mts_acc += mts_delta;
+                mts_acc += mts_delta + mts_slew;
 
                 /* PI controller: compare the input ring fill with the target and
                  * slowly adapt the resampling ratio.  Positive error (buffer too
@@ -651,16 +650,20 @@ int main(int argc, char **argv)
                 double fill = (double)slen - rpos;
                 double err = (fill - (double)target_frames) / (double)target_frames;
                 double dt = (double)c.pkt / (double)c.rate;
-                corr_i += 5e-4 * err * dt;
-                if (corr_i > 0.01) corr_i = 0.01;
-                if (corr_i < -0.01) corr_i = -0.01;
-                double corr = 2e-4 * err + corr_i;
+                /* Proportional term reacts quickly to a large fill error; the
+                 * small leaky integral removes the steady-state source-clock
+                 * offset.  The old 1% integral windup caused huge 864..1086 ms
+                 * fill swings when a PTP/input event disturbed the buffer. */
+                corr_i += 5e-5 * err * dt;
+                corr_i *= (1.0 - 1e-7);             /* leak, ~2.8 h time constant */
+                if (corr_i > 0.0005) corr_i = 0.0005;
+                if (corr_i < -0.0005) corr_i = -0.0005;
+                double corr = 0.01 * err + corr_i;
                 if (corr > 0.01) corr = 0.01;
                 if (corr < -0.01) corr = -0.01;
                 double cstep = 1.0 + corr;              /* source frames per output frame */
 
                 uint32_t ts = (uint32_t)mts_acc;
-                media_ts = ts;
                 out[0]=0x80; out[1]=(unsigned char)(c.pt & 0x7f);
                 out[2]=(seq>>8)&0xff; out[3]=seq&0xff;
                 out[4]=(ts>>24)&0xff; out[5]=(ts>>16)&0xff; out[6]=(ts>>8)&0xff; out[7]=ts&0xff;
@@ -708,34 +711,35 @@ int main(int argc, char **argv)
                 seq++; lastts = ts; pktcnt++; octet += packet_bytes;
                 slot++;
 
-                /* PTP-step detection.  The media clock is seeded from the PHC
-                 * once and then advanced by the exact sample count; a PTP step
-                 * (grandmaster reboot/reconfiguration, switch hiccup) leaves it
-                 * at the old offset, which a Dante receiver sees as permanent
-                 * "Late" packets.  Every 250 packets compare the absolute RTP
-                 * timestamp with the PHC; two consecutive checks more than 3 ms
-                 * apart mean a real step, so reseed the media clock in place.
-                 * A short timestamp discontinuity is much better than a service
-                 * restart (no Liquidsoap reconnect) and the receiver re-locks. */
+                /* Media-clock PLL.  Instead of hard-reseeding on every small
+                 * PTP offset (which creates RTP-timestamp discontinuities and
+                 * Dante "Late" bursts), slew the timestamp increment toward the
+                 * PHC over ~30 s.  Only a genuine large step (>20 ms) gets a
+                 * hard reseed.  This keeps the RTP clock continuous while
+                 * tracking the grandmaster. */
                 if ((pktcnt % 250) == 0) {
                     long diff = ptp_media_diff(c.rate, ts);
-                    long lim = (long)(0.002 * (double)c.rate);
-                    if (llabs(diff) > lim) {
-                        if (++step_bad >= 2) {
-                            double ps = phc_sec();
-                            if (ps > 0) {
-                                mts_acc = fmod(ps * (double)c.rate, 4294967296.0);
-                                media_ts = (uint32_t)mts_acc;
-                                base_phc = ps;
-                                slot = 0;
-                                step_bad = 0;
-                                fprintf(stderr,
-                                        "PTP step detected (%+.1f ms) - media clock reseeded\n",
-                                        (double)diff * 1000.0 / (double)c.rate);
-                            }
+                    long hard_lim = (long)(0.020 * (double)c.rate);
+                    if (llabs(diff) > hard_lim) {
+                        double ps = phc_sec();
+                        if (ps > 0) {
+                            mts_acc = fmod(ps * (double)c.rate, 4294967296.0);
+                            mts_slew = 0.0;
+                            base_phc = ps;
+                            slot = 0;
+                            fprintf(stderr,
+                                    "large PTP step detected (%+.1f ms) - hard reseed\n",
+                                    (double)diff * 1000.0 / (double)c.rate);
                         }
                     } else {
-                        step_bad = 0;
+                        /* correct the offset over ~30 s, capped at 500 ppm */
+                        double target_slew =
+                            (double)diff * (double)c.pkt /
+                            ((double)c.rate * 30.0);
+                        double max_slew = 500e-6 * (double)c.pkt;
+                        if (target_slew > max_slew) target_slew = max_slew;
+                        if (target_slew < -max_slew) target_slew = -max_slew;
+                        mts_slew = target_slew;
                     }
                 }
 
@@ -800,6 +804,8 @@ int main(int argc, char **argv)
     } else {
         /* ---- RTP source input --------------------------------------- */
         struct pollfd pf; pf.fd = rx; pf.events = POLLIN;
+        double relay_ts_acc = 0.0;                  /* fractional, PHC-seeded relay clock */
+        double relay_slew = 0.0;                    /* PLL: extra samples per source packet */
         while (!g_stop) {
             int pr = poll(&pf, 1, 1000);
             if (pr <= 0) continue;
@@ -818,15 +824,17 @@ int main(int argc, char **argv)
             if (plen <= 0) continue;
 
             uint32_t ts;
+            int relay_spp = c.pkt;
             if (c.restamp) {
                 /* Smooth media clock: seed once from the PHC, then advance by the exact
-                 * sample count per packet.  Re-reading the raw PHC each packet jitters. */
+                 * sample count per packet.  The fractional accumulator lets the PLL
+                 * slew the timestamps without ever jumping. */
                 int bps = c.bitdepth / 8, nch = c.channels > 0 ? c.channels : 2;
-                int samples_per_pkt = plen / (bps * nch);
-                if (samples_per_pkt <= 0) samples_per_pkt = c.pkt;
-                if (media_ts == 0) { double s0 = phc_sec(); if (s0 < 0) s0 = 0; media_ts = (uint32_t)(s0 * (double)c.rate); }
-                ts = media_ts;
-                media_ts += (uint32_t)samples_per_pkt;
+                relay_spp = plen / (bps * nch);
+                if (relay_spp <= 0) relay_spp = c.pkt;
+                if (relay_ts_acc == 0.0) { double s0 = phc_sec(); if (s0 < 0) s0 = 0; relay_ts_acc = s0 * (double)c.rate; }
+                ts = (uint32_t)relay_ts_acc;
+                relay_ts_acc += (double)relay_spp + relay_slew;
             } else {
                 ts = ((uint32_t)in[4]<<24)|((uint32_t)in[5]<<16)|((uint32_t)in[6]<<8)|(uint32_t)in[7];
             }
@@ -841,25 +849,29 @@ int main(int argc, char **argv)
             }
             seq++; lastts=ts; pktcnt++; octet += plen;
 
-            /* Same PTP-step detection for the relay path.  Only when we are
+            /* Same media-clock PLL for the relay path.  Only when we are
              * re-stamping (--keep-ts means the source's timestamps are not
-             * necessarily PHC-referenced and must not be reseeded). */
+             * necessarily PHC-referenced and must not be touched). */
             if (c.restamp && (pktcnt % 250) == 0) {
                 long diff = ptp_media_diff(c.rate, lastts);
-                long lim = (long)(0.002 * (double)c.rate);
-                if (llabs(diff) > lim) {
-                    if (++step_bad >= 2) {
-                        double ps = phc_sec();
-                        if (ps > 0) {
-                            media_ts = (uint32_t)fmod(ps * (double)c.rate, 4294967296.0);
-                            step_bad = 0;
-                            fprintf(stderr,
-                                    "PTP step detected (%+.1f ms) - media clock reseeded\n",
-                                    (double)diff * 1000.0 / (double)c.rate);
-                        }
+                long hard_lim = (long)(0.020 * (double)c.rate);
+                if (llabs(diff) > hard_lim) {
+                    double ps = phc_sec();
+                    if (ps > 0) {
+                        relay_ts_acc = ps * (double)c.rate;
+                        relay_slew = 0.0;
+                        fprintf(stderr,
+                                "large PTP step detected (%+.1f ms) - hard reseed\n",
+                                (double)diff * 1000.0 / (double)c.rate);
                     }
                 } else {
-                    step_bad = 0;
+                    double target_slew =
+                        (double)diff * (double)relay_spp /
+                        ((double)c.rate * 30.0);
+                    double max_slew = 500e-6 * (double)relay_spp;
+                    if (target_slew > max_slew) target_slew = max_slew;
+                    if (target_slew < -max_slew) target_slew = -max_slew;
+                    relay_slew = target_slew;
                 }
             }
 

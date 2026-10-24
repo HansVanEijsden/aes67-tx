@@ -193,7 +193,7 @@ ffmpeg -hide_banner -loglevel error -reconnect 1 -reconnect_streamed 1 -reconnec
   it the sender happily transmits silent zero packets forever, so a packet watchdog sees
   "healthy" traffic. Use `-U 10` for an internet-fed service; systemd then restarts the chain.
 
-### PTP step detection (v1.6.1+)
+### Media-clock PLL and PTP steps (v1.7.0)
 
 The media clock is seeded from the PTP hardware clock once and then advanced by exact sample
 counts. That gives a clean, jitter-free clock, but it also means a **PTP step** — a
@@ -409,6 +409,10 @@ own once the upstream returns — no watchdog needed there.
 
 ## Version history
 
+- **1.7.0** — media-clock **PLL/slew** instead of frequent hard reseeds (small PTP offsets are
+  tracked continuously, only >20 ms steps reseed), plus ASRC **anti-windup** (leaky integral,
+  smaller clamps) to stop 864..1086 ms fill swings. This targets the repeated Dante "Late"
+  bursts seen with a free-running media clock.
 - **1.6.3** — `--raw` option **`-U/--underrun-exit N`**: exit after N seconds of buffer
   underrun so systemd restarts a pipeline whose decoder is still alive but no longer
   delivering PCM. The Salland1 service uses `-U 10`.
