@@ -1,8 +1,7 @@
 # aes67-tx — operational status
 
-**Last verified:** 2026-10-28 (Europe/Amsterdam)  
-**Current version:** 1.7.0 in production; 1.7.1 in the repository (stall-handling fix, see the
-verification section below — not deployed at the time of writing)  
+**Last verified:** 2026-10-28 23:58 (Europe/Amsterdam)  
+**Current version:** 1.7.1 (deployed 2026-10-28 23:57; see the verification section below)  
 **Repository:** public — this file deliberately contains no secrets, credentials, host/IP addresses, PTP grandmaster identifiers, stream URLs or private network details. Operational runbooks remain in the private infrastructure documentation.
 
 ## Current production state
@@ -11,8 +10,8 @@ One Linux host acts as a PTP slave of the Dante/AES67 grandmaster and publishes 
 
 | Flow | Source | Mode | Status |
 |---|---|---|---|
-| 1Zwolle HD | Stereo Tool AES67 / LiveWire | RTP relay, re-stamped from the PTP hardware clock | `1.7.0`, up since 2026-10-24, no service restarts |
-| Salland1 HD | Salland1 HTTP/FLAC stream | Liquidsoap → raw 24-bit PCM → `aes67-tx --raw` | `1.7.0`, current run up since 2026-10-27 after two input-stall restarts |
+| 1Zwolle HD | Stereo Tool AES67 / LiveWire | RTP relay, re-stamped from the PTP hardware clock | `1.7.1`, up since 2026-10-28 23:57 (deployment restart) |
+| Salland1 HD | Salland1 HTTP/FLAC stream | Liquidsoap → raw 24-bit PCM → `aes67-tx --raw` | `1.7.1`, up since 2026-10-28 23:57 (deployment restart) |
 
 The Salland1 chain:
 
@@ -23,7 +22,7 @@ The Salland1 chain:
 
 The 1Zwolle HD relay and the Salland1 receiver share the same binary and PTP PLL. The 1Zwolle **webstream** Liquidsoap service is a separate production chain and was not touched during this work.
 
-GitHub releases exist for **v1.5.0 through v1.7.0**; v1.7.0 is the latest. The releases provide source archives only (no binary assets). Documentation-only commits use `[no release]` and do not trigger a new release.
+GitHub releases exist for **v1.5.0 through v1.7.1**; v1.7.1 is the latest. The releases provide source archives only (no binary assets). Documentation-only commits use `[no release]` and do not trigger a new release.
 
 ## Current health
 
@@ -51,12 +50,29 @@ same signature as 2026-10-27 21:29. `ptp4l` never moved during any of it.
 
 Cause: the raw path restarted its emit schedule after a missed slot without advancing the media
 clock, so a stall left a permanent offset that the detector then treated as a PTP step; the relay
-clock advances on received packets, so network gaps and bursts modulate it directly. v1.7.1 (in
-the repository, not yet deployed) catches up stalls ≤100 ms, resynchronises longer ones with a
-bounded jump, and logs the real cause. The remaining question — what makes the host stall for
-20–50 ms about once a day — is host-level: real-time scheduling/preemption, D-state (load
-average ~6 while 88% idle), or the stream watchdog's `tcpdump` promiscuous-mode flapping (46
-enter/leave events per minute; now started with `-p`).
+clock advances on received packets, so network gaps and bursts modulate it directly. v1.7.1
+catches up stalls ≤100 ms, resynchronises longer ones with a bounded jump, and logs the real
+cause. The remaining question — what makes the host stall for 20–50 ms about once a day — is
+host-level: real-time scheduling/preemption, D-state (load average ~6 while 88% idle), or the
+stream watchdog's `tcpdump` promiscuous-mode flapping (46 enter/leave events per minute before
+the change).
+
+### Deployment of v1.7.1 (2026-10-28 23:57)
+
+- Built from the released source on the host (`gcc -O2 -Wall -Wextra`, no warnings; CI green on
+  both `main` and the tag). Source sha256 verified after transfer.
+- The stall test was run against the exact artefact first, on scratch group 239.69.100.250:
+  10/30/50 ms stalls → 0 reseeds, RTP↔PHC offset stays ≈ −0.75 ms; 150 ms → 1 bounded resync +
+  1 reseed. `RESULT: PASS`.
+- Binary installed atomically (`mv` over `/usr/local/bin/aes67-tx`); previous version kept as
+  `/usr/local/bin/aes67-tx.1.7.0.bak` (sha256 `abded389…`).
+- `aes67-stream-watchdog.sh` updated (`tcpdump -p`), previous copy kept as
+  `/usr/local/bin/aes67-stream-watchdog.sh.1.7.0.bak`.
+- Services restarted one at a time: relay 23:57:16, Salland1 23:57:25. Both running binaries
+  verified through `sha256sum /proc/<pid>/exe`.
+- Post-deployment: both groups live, Salland1 `fill` ≈ 1001 ms, `corr` +18 ppm, 0 underruns,
+  RTP↔PHC offset −0.08 ms, `portState SLAVE`, `gmPresent` true; **no** reseeds/resyncs so far;
+  promiscuous-mode kernel events dropped from ~45/min to **0/min**.
 
 Measurement after ~3 h 48 min on 2026-10-24:
 
@@ -83,30 +99,28 @@ Dante gives AES67 flows a fixed 2 ms latency budget; DVS can use its 5 ms settin
 1. **Reuse the existing multicast groups, SSRC, payload type and SDP sessions.** Service changes must not require a new Dante Controller import.
 2. **Liquidsoap is the Salland1 front-end**, not ffmpeg. It provides robust HTTP reconnection/decoding; `mksafe` keeps the process alive during short input loss.
 3. **Target 1 s buffer, 3 s ring capacity** for the internet-fed Salland1 flow. This is intentional latency for network robustness; it is not a Dante latency setting.
-4. **PLL/slew instead of frequent hard reseeds.** Small offsets are corrected continuously; hard reseed is reserved for large PTP steps.
+4. **PLL/slew instead of frequent hard reseeds.** Small offsets are corrected continuously; hard reseed is reserved for a real large step or a stall longer than the bounded catch-up (100 ms).
 5. **Chrony and PTP are separate clock domains.** Chrony disciplines the wall clock; `aes67-tx` uses the PTP hardware clock directly. Do not tie the system clock to the Dante clock.
 6. **Keep the 1Zwolle webstream chain isolated.** Restarting or changing it is not part of AES67 maintenance.
 
 ## Open items
 
-1. **Host-side stalls of 20–50 ms, roughly daily,** are the real cause of the reseed events — not grandmaster steps (see the verification section). v1.7.1 removes the false "PTP step" reseed for stalls ≤100 ms. Still open: what makes the host stall. Candidates: real-time scheduling/preemption (`aes67-tx` runs at nice −10, not SCHED_FIFO; the DAB/dab-scripts and `odr-audioenc` compete for the same cores), D-state/NFS (load average ~6 while 88% idle), and the stream watchdog's `tcpdump` promiscuous flapping (now `-p`, to be confirmed in the kernel log after deployment).
+1. **Host-side stalls of 20–50 ms, roughly daily,** are the real cause of the reseed events — not grandmaster steps (see the verification section). v1.7.1 removes the false "PTP step" reseed for stalls ≤100 ms. Still open: what makes the host stall. Candidates: real-time scheduling/preemption (`aes67-tx` runs at nice −10, not SCHED_FIFO; the DAB/dab-scripts and `odr-audioenc` compete for the same cores) and D-state/NFS (load average ~6 while 88% idle); the stream watchdog's promiscuous-mode flapping was removed in the same deployment (~45/min → 0/min).
 2. **Salland1 input stalls.** Two 10 s underrun restarts occurred on 2026-10-27. `-U 10` handled them correctly, but the upstream cause was not identified.
 3. **Audio-level watchdog not implemented.** The packet watchdog and underrun timeout cover a dead pipe, but not the case where the decoder keeps sending *silent* PCM with valid packet timing.
 4. **Residual Late spikes / relay clock.** 1Zwolle's unbuffered relay peaks at ~15 ms and its media clock advances on *received* packets, so receive gaps and bursts modulate the RTP timestamps directly (the +34/−26 ms reseed pair on 2026-10-27 21:29 was exactly this). Planned v1.7.2: anchor the relay clock on the PHC with a small jitter buffer (or a 1–2 ms timestamp lead), tested on a scratch group first. Steady-state arrival is clean: 1000 pps, intervals 0.72–1.61 ms.
-5. **1Zwolle AES67 relay** runs the same binary (1.7.0 in production, 1.7.1 pending); its webstream Liquidsoap service remains separate and unchanged.
+5. **1Zwolle AES67 relay** runs the same 1.7.1 binary; its webstream Liquidsoap service remains separate and unchanged.
 
 ## Next step
 
 Start the next workspace by re-reading this file and the README, then verify the current
 service/version and PTP offsets before changing anything. The first priorities are:
 
-- **deploy v1.7.1** (build from the repository, test the same stall scenario with
-  `tools/media-clock-stall-test.sh` on a scratch group, then install and restart the two
-  services one at a time);
-- after deployment, check the kernel log for the disappeared `entered/left promiscuous mode`
-  lines and watch a week of `journalctl` for `media clock resynced` / `hard reseed`;
+- watch `journalctl` for about a week: the reseed bursts should stop; only a real stall >100 ms
+  should now show `media clock resynced (+100.0 ms of …)`, and the promiscuous-mode kernel spam
+  should stay gone (0/min measured right after deployment);
 - identify the host-side stalls (scheduling vs D-state vs NIC), because those are the real
-  cause of the discontinuities;
+  cause of any remaining discontinuity;
 - then anchor the relay clock on the PHC (v1.7.2, small jitter buffer) — this also addresses
   the residual Late spikes; test on a non-production group first;
 - add an audio-level watchdog if silent-PCM failures matter.
