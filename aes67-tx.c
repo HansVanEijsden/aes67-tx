@@ -66,7 +66,7 @@
 #include <net/if.h>
 
 #define PROGRAM   "aes67-tx"
-#define VERSION   "1.7.0"
+#define VERSION   "1.7.1"
 
 /* POSIX clock number of a PTP hardware clock (PHC), as used by linuxptp.
  * It is the same magic value for every /dev/ptpN; the kernel resolves it to
@@ -78,6 +78,15 @@
 
 /* default PTP clock device */
 #define DEFAULT_PTP "/dev/ptp0"
+
+/* Maximum emitter catch-up, in seconds.  If the output loop is not scheduled
+ * for longer than this (a stalled or descheduled process, a busy real-time
+ * host, or a PTP step while we were not looking), the media clock is
+ * resynchronised to the PHC in one bounded jump instead of bursting out a
+ * huge backlog of packets.  Shorter lags are absorbed by emitting the backlog
+ * immediately, so the media clock stays locked to the PHC without a timestamp
+ * discontinuity. */
+#define MAX_CATCHUP_S 0.100
 
 typedef struct {
     char   in_addr[64];      /* input multicast group            */
@@ -190,9 +199,12 @@ static double phc_sec(void)
 
 /* Difference (in samples) between the current PTP/PHC time and an RTP media
  * timestamp, wrapped to ±2^31 samples.  The media clock is seeded from the PHC
- * at startup, so in normal operation this is within about a millisecond.  A
- * PTP step (grandmaster reboot/reconfiguration) leaves the media clock at the
- * old offset; the main loops use this value to detect and correct that. */
+ * at startup, so in normal operation this is within about a millisecond.  An
+ * emitter stall (a descheduled / busy process) or a real PTP step
+ * (grandmaster reboot/reconfiguration) both leave the media clock off the PHC;
+ * the main loops use this value to detect and correct that.  Note that a
+ * difference here is *not* proof of a PTP step: see the catch-up block in the
+ * raw path and the note in the relay path. */
 static long ptp_media_diff(int rate, uint32_t media_ts)
 {
     double now = phc_sec();
@@ -630,8 +642,36 @@ int main(int argc, char **argv)
              * so the media clock never stalls/drifts from the grandmaster, which is what
              * a strict receiver flags as "Late". */
             {
-                /* restart the schedule if it genuinely fell behind (never burst) */
-                if (phc_now - target_phc > pkt_period) { base_phc = phc_now; slot = 0; }
+                /* Did we fall behind the PHC (scheduling stall, or a PTP step while
+                 * we were not looking)?  The media clock must stay locked to the
+                 * PHC, so keep the schedule and emit the backlog immediately: the
+                 * loop then catches up packet by packet while the timestamps stay
+                 * continuous (the receiver may mark those packets Late, but it
+                 * never sees a media-clock jump).
+                 *
+                 * Before v1.7.1 only the schedule was restarted here, so the media
+                 * clock kept a permanent offset behind the PHC.  The detector below
+                 * then reported that offset as a "PTP step" and fired a disruptive
+                 * hard reseed - the mechanism behind the recurring reseeds seen in
+                 * production while ptp4l itself never moved.
+                 *
+                 * A lag beyond MAX_CATCHUP_S is not worth bursting: reset the
+                 * schedule and advance the media clock over the missed time in one
+                 * bounded jump.  Any offset still larger than the detector limit is
+                 * then reseeded by the PLL block below. */
+                if (phc_now - target_phc > MAX_CATCHUP_S) {
+                    double missed = phc_now - target_phc;
+                    double jump   = missed > MAX_CATCHUP_S ? MAX_CATCHUP_S : missed;
+                    if (mts_acc != 0.0) {
+                        mts_acc += jump * (double)c.rate;
+                        mts_slew = 0.0;
+                        fprintf(stderr,
+                                "media clock resynced (+%.1f ms of %.1f ms) - emitter stalled longer than %.0f ms\n",
+                                jump * 1000.0, missed * 1000.0, MAX_CATCHUP_S * 1000.0);
+                    }
+                    base_phc = phc_now;
+                    slot = 0;
+                }
                 /* The media clock advances by the exact sample count per packet, and the
                  * emit itself is paced at the PHC (grandmaster) slots above, so the rate is
                  * the grandmaster rate automatically — no measured-rate bias, even clock. */
@@ -712,11 +752,13 @@ int main(int argc, char **argv)
                 slot++;
 
                 /* Media-clock PLL.  Instead of hard-reseeding on every small
-                 * PTP offset (which creates RTP-timestamp discontinuities and
+                 * PHC offset (which creates RTP-timestamp discontinuities and
                  * Dante "Late" bursts), slew the timestamp increment toward the
-                 * PHC over ~30 s.  Only a genuine large step (>20 ms) gets a
-                 * hard reseed.  This keeps the RTP clock continuous while
-                 * tracking the grandmaster. */
+                 * PHC over ~30 s.  The catch-up block above already keeps the
+                 * media clock locked for short stalls; a hard reseed is left for
+                 * an offset that survives that, i.e. a real step or a very long
+                 * stall.  This keeps the RTP clock continuous while tracking the
+                 * grandmaster. */
                 if ((pktcnt % 250) == 0) {
                     long diff = ptp_media_diff(c.rate, ts);
                     long hard_lim = (long)(0.020 * (double)c.rate);
@@ -728,7 +770,7 @@ int main(int argc, char **argv)
                             base_phc = ps;
                             slot = 0;
                             fprintf(stderr,
-                                    "large PTP step detected (%+.1f ms) - hard reseed\n",
+                                    "media clock off PHC by %+.1f ms - hard reseed (long stall or PTP step)\n",
                                     (double)diff * 1000.0 / (double)c.rate);
                         }
                     } else {
@@ -851,7 +893,14 @@ int main(int argc, char **argv)
 
             /* Same media-clock PLL for the relay path.  Only when we are
              * re-stamping (--keep-ts means the source's timestamps are not
-             * necessarily PHC-referenced and must not be touched). */
+             * necessarily PHC-referenced and must not be touched).
+             *
+             * The relay clock advances on *received* packets, so a receive gap
+             * leaves it behind the PHC and an incoming burst leaves it ahead:
+             * that offset is corrected here, but it is an arrival-timing effect,
+             * not necessarily a grandmaster step (hence the honest log text).
+             * Anchoring the relay clock on the PHC with a small jitter buffer
+             * instead of on packet arrival is still open (see STATUS.md). */
             if (c.restamp && (pktcnt % 250) == 0) {
                 long diff = ptp_media_diff(c.rate, lastts);
                 long hard_lim = (long)(0.020 * (double)c.rate);
@@ -861,7 +910,7 @@ int main(int argc, char **argv)
                         relay_ts_acc = ps * (double)c.rate;
                         relay_slew = 0.0;
                         fprintf(stderr,
-                                "large PTP step detected (%+.1f ms) - hard reseed\n",
+                                "media clock off PHC by %+.1f ms - hard reseed (receive gap/burst or PTP step)\n",
                                 (double)diff * 1000.0 / (double)c.rate);
                     }
                 } else {

@@ -195,27 +195,48 @@ ffmpeg -hide_banner -loglevel error -reconnect 1 -reconnect_streamed 1 -reconnec
   it the sender happily transmits silent zero packets forever, so a packet watchdog sees
   "healthy" traffic. Use `-U 10` for an internet-fed service; systemd then restarts the chain.
 
-### Media-clock PLL and PTP steps (v1.7.0)
+### Media-clock PLL, emitter stalls and PTP steps (v1.7.0 / v1.7.1)
 
 The media clock is seeded from the PTP hardware clock once and then advanced by exact sample
-counts. That gives a clean, jitter-free clock, but it also means a **PTP step** — a
-grandmaster reboot, a VertoMX/clock reconfiguration or a switch hiccup — would leave the media
-clock at the old offset. A Dante receiver then reports a constant "Late" offset (and may mute
-the channel) until the sender is restarted.
+counts. An offset between the RTP timestamp and the PHC therefore means one of two things: the
+**sender itself fell behind** (a descheduled or busy process, or a receive gap in the relay
+path), or the clock really **stepped** (grandmaster reboot, VertoMX/clock reconfiguration,
+switch hiccup). A Dante receiver reports either as a "Late" offset and may mute the channel
+until it is corrected.
 
-Since **v1.6.1**, both the RTP relay and the `--raw` path check the **absolute** difference
-between the RTP timestamp and the PHC every 250 packets. If two consecutive checks are more
-than **3 ms** apart, the sender logs
+Since **v1.7.1** the sender distinguishes them as far as it can:
 
-```
-PTP step detected (-9.0 ms) - media clock reseeded
-```
+- **Stalls up to 100 ms** (`MAX_CATCHUP_S`) are caught up: the sender keeps its emit schedule
+  and sends the backlog immediately, so the media clock stays locked to the PHC and the RTP
+  timestamps stay continuous. The receiver may flag those packets "Late", but it never sees a
+  media-clock jump. (Before v1.7.1 only the schedule was restarted, which left the media clock
+  permanently behind the PHC; a quarter of a second later the step detector reported that as a
+  "PTP step" and fired a disruptive hard reseed. Diagnosis in October 2026 showed that every
+  reseed in production happened while `ptp4l` itself stayed within a few µs and
+  `gmTimeBaseIndicator` was 0 — they were local stalls, not grandmaster steps.)
+- **A lag beyond 100 ms** is not worth bursting: the media clock is resynchronised in one
+  bounded jump and the log says
 
-and reseeds the media clock in place. The RTP timestamp gets a short discontinuity, but the
-service, the Liquidsoap input and the ASRC buffer keep running; the receiver re-locks within a
-few packets. This is deliberately an in-process correction (no service restart, no stream
-reconnect). `--keep-ts` disables the check, because forwarded source timestamps are not
-necessarily PHC-referenced.
+      media clock resynced (+100.0 ms of 150.3 ms) - emitter stalled longer than 100 ms
+
+- **Small offsets** are slewed out over ~30 s by the PLL (bounded to 500 ppm), so timestamps
+  stay continuous.
+- **A real PTP step** — or any offset that survives the catch-up — is corrected in place every
+  250 packets when the absolute RTP↔PHC difference exceeds **20 ms**:
+
+      media clock off PHC by -9.0 ms - hard reseed (long stall or PTP step)
+
+  The RTP timestamp gets a short discontinuity, but the service, the Liquidsoap input and the
+  ASRC buffer keep running; the receiver re-locks within a few packets. This is deliberately an
+  in-process correction (no service restart, no stream reconnect). In the relay path the text is
+  `...(receive gap/burst or PTP step)`, because the relay clock advances on *received* packets:
+  a receive gap leaves it behind the PHC and the following burst leaves it ahead. Anchoring the
+  relay clock on the PHC with a small jitter buffer is still an open item (see STATUS.md).
+- `--keep-ts` disables the check, because forwarded source timestamps are not necessarily
+  PHC-referenced.
+
+`tools/media-clock-stall-test.sh` reproduces the stall cases on a scratch multicast group
+(`SIGSTOP`/`SIGCONT` on a private sender and relay) without touching the production flows.
 
 ### Output interface
 
@@ -322,7 +343,7 @@ The newly published source is a normal AES67 multicast stream on the output grou
 | `ptp4l` stuck in `UNCALIBRATED` | The grandmaster only answers unicast delay requests — add `hybrid_e2e 1` (see above). |
 | Flow is green but **muted**, or no "playing" speaker; latency value jumps on each restart | The media clock is not in lockstep with the grandmaster — likely because the source's timestamps are forwarded instead of re-stamped, or the SDP lacks `a=ts-refclk`. Use the default **`--re-stamp`** and add the PTP reference (see **Example SDP**). |
 | Flow is green but no signal on the mixer | The destination (e.g. a MADI/console output) may be inactive, or the SDP lacks the PTP reference (`a=ts-refclk`). Use `example-sdp-refclk.txt`. |
-| Latency bars red / packets **Late** by many ms | SDP has no `a=ts-refclk`, or the sender's media clock is offset after a PTP step. Add `ts-refclk`; v1.6.2 reseeds automatically (log `PTP step detected`), otherwise restart the sender service once. |
+| Latency bars red / packets **Late** by many ms | SDP has no `a=ts-refclk`, or the sender's media clock is offset from the PHC. Add `ts-refclk`; the sender reseeds automatically (log `media clock off PHC by ... - hard reseed`), otherwise restart the sender service once. |
 | No audio data / silence | Check the source multicast is flowing (`tcpdump -i eth0 "udp port 5004"`), that you are using the right interface (`-f`), and that the source is not silent. |
 | Sender Report interval too aggressive | `--sr-interval` is in seconds; leave at least 1. |
 
@@ -411,6 +432,15 @@ own once the upstream returns — no watchdog needed there.
 
 ## Version history
 
+- **1.7.1** — the "PTP step" detector no longer fires on local emitter stalls. A stall ≤100 ms
+  is caught up (emit schedule kept, timestamps stay continuous) instead of leaving the media
+  clock permanently behind the PHC; a longer stall is resynchronised in one bounded jump
+  (`media clock resynced`). Log texts now say what actually happened (`media clock off PHC by
+  ... - hard reseed (long stall or PTP step)`). Diagnosis: production reseeds in Oct 2026 all
+  occurred while `ptp4l` stayed at a few µs with `gmTimeBaseIndicator` 0. The stream watchdog
+  now captures with `tcpdump -p`, so it no longer flips promiscuous mode on the shared
+  production NIC (~46 times/minute before). New `tools/media-clock-stall-test.sh` reproduces
+  the stall cases on a scratch group.
 - **1.7.0** — media-clock **PLL/slew** instead of frequent hard reseeds (small PTP offsets are
   tracked continuously, only >20 ms steps reseed), plus ASRC **anti-windup** (leaky integral,
   smaller clamps) to stop 864..1086 ms fill swings. This targets the repeated Dante "Late"

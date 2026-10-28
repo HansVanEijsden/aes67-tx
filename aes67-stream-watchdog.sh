@@ -21,7 +21,13 @@ BAD_LIMIT=3      # restart after this many silent windows (~24 s)
 
 bad=0
 while true; do
-    cnt=$(timeout "$CAPTURE" tcpdump -i eno1 -nn -c 1 -q "dst host $DST and udp port $PORT" 2>/dev/null | wc -l)
+    # -p: capture without promiscuous mode.  Verified (2026-10-28) that this
+    # still sees the multicast output group, and it stops tcpdump from
+    # toggling promiscuous mode on the shared production interface every few
+    # seconds (~46 enter/leave events per minute in the kernel log before this
+    # change), which is both log noise and a plausible source of brief RX gaps
+    # for the AES67 senders on the same NIC.
+    cnt=$(timeout "$CAPTURE" tcpdump -p -i eno1 -nn -c 1 -q "dst host $DST and udp port $PORT" 2>/dev/null | wc -l)
     if [ "$cnt" -gt 0 ]; then
         bad=0                       # healthy: a packet arrived
     else
