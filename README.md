@@ -11,6 +11,8 @@ Many broadcast AES67/Dante receivers (mixers, MADI bridges, Dante Controllers) a
 
 It is a small, single-file C program with no runtime dependencies beyond a PTP-capable NIC.
 
+> **Operational status:** see [STATUS.md](STATUS.md) for the current production state, decisions, open items and next step.
+
 ---
 
 ## Typical use case
