@@ -1,6 +1,6 @@
 # aes67-tx — operational status
 
-**Last verified:** 2026-10-28 23:58 (Europe/Amsterdam)  
+**Last verified:** 2026-11-05 15:46 (Europe/Amsterdam)  
 **Current version:** 1.7.1 (deployed 2026-10-28 23:57; see the verification section below)  
 **Repository:** public — this file deliberately contains no secrets, credentials, host/IP addresses, PTP grandmaster identifiers, stream URLs or private network details. Operational runbooks remain in the private infrastructure documentation.
 
@@ -11,7 +11,7 @@ One Linux host acts as a PTP slave of the Dante/AES67 grandmaster and publishes 
 | Flow | Source | Mode | Status |
 |---|---|---|---|
 | 1Zwolle HD | Stereo Tool AES67 / LiveWire | RTP relay, re-stamped from the PTP hardware clock | `1.7.1`, up since 2026-10-28 23:57 (deployment restart) |
-| Salland1 HD | Salland1 HTTP/FLAC stream | Liquidsoap → raw 24-bit PCM → `aes67-tx --raw` | `1.7.1`, up since 2026-10-28 23:57 (deployment restart) |
+| Salland1 HD | Salland1 HTTP/FLAC stream | Liquidsoap → raw 24-bit PCM → `aes67-tx --raw` | `1.7.1`, up since 2026-11-04 22:19 (upstream underrun restarts on 3 and 4 Nov) |
 
 The Salland1 chain:
 
@@ -26,11 +26,11 @@ GitHub releases exist for **v1.5.0 through v1.7.1**; v1.7.1 is the latest. The r
 
 ## Current health
 
-Latest measured production values:
+Latest measured production values (2026-11-05 15:46):
 
-- Salland1 PTP offset: ~**+0.04 ms**; 1Zwolle: ~**+0.03 ms**.
+- Salland1 RTP↔PHC offset: **−0.02…+0.02 ms**; PTP `master_offset` −9.1 µs, `offsetFromMaster` 2.6 µs.
 - Salland1 buffer: **1000.0 ms** (target 1000 ms), `corr` **0.0 ppm**, **0 underruns**.
-- Last observed hard PTP reseed: 2026-10-28 04:16; none since then.
+- Last hard reseed: **2026-11-04 04:20:37** (+44.7 ms, Salland1 only, no PTP event); before that none since the v1.7.1 deployment on 2026-10-28.
 
 ## Verification on 2026-10-28 (evening)
 
@@ -74,6 +74,28 @@ the change).
   RTP↔PHC offset −0.08 ms, `portState SLAVE`, `gmPresent` true; **no** reseeds/resyncs so far;
   promiscuous-mode kernel events dropped from ~45/min to **0/min**.
 
+### Week after deployment (measured 2026-11-05 15:46)
+
+- Relay: **one continuous run of 7 d 15 h**, 0 restarts, no reseeds at all. Both running
+  processes verified as 1.7.1 (`sha256sum /proc/<pid>/exe`).
+- False reseeds: **7 events in 4.5 days before → 1 in 7.6 days after**; 0 `media clock resynced`
+  (i.e. no stall exceeded the 100 ms catch-up window). Promiscuous-mode kernel events stayed at
+  **0/min** all week.
+- The single reseed (2026-11-04 04:20:37, `+44.7 ms`) was again **not** a grandmaster step:
+  `ptp4l` stayed at rms 0.1–6.3 µs / max 12.7 µs around it, `gmTimeBaseIndicator` is still 0, and
+  the relay — which compares against the same PHC — logged nothing. So it is local to the
+  Salland1 process. Remaining hole: a short *backward* PHC excursion (the emit loop then simply
+  waits, so no forward lag is ever seen) or a preemption exactly inside the detector window is
+  not caught by the catch-up. Candidate v1.7.2: log the emit lag at the moment of reseed, and
+  catch up instead of reseeding when the loop itself is behind schedule.
+- Salland1: two upstream underrun exits (`raw input underrun for 10 s`, 2026-11-03 09:19:58 and
+  2026-11-04 22:19:04); Liquidsoap reconnected and the service restarted cleanly via `-U 10`
+  plus systemd. Upstream cause still unidentified (open item 2). Current run (since 11-04
+  22:19): `fill` 1000.0 ms, `corr` +0.0 ppm, 0 underruns, RTP↔PHC offset ±0.02 ms.
+- PTP: `portState SLAVE`, `gmPresent` true, `master_offset` −9.1 µs and `offsetFromMaster`
+  2.6 µs — noticeably noisier than the −0.3 µs / −0.07 µs of 2026-10-28, but still far inside
+  the 2 ms Dante budget. System load unchanged (~5.5 on 6 cores, ~88% idle).
+
 Measurement after ~3 h 48 min on 2026-10-24:
 
 | Flow | Average latency | Peak | Late packets | Notes |
@@ -105,8 +127,8 @@ Dante gives AES67 flows a fixed 2 ms latency budget; DVS can use its 5 ms settin
 
 ## Open items
 
-1. **Host-side stalls of 20–50 ms, roughly daily,** are the real cause of the reseed events — not grandmaster steps (see the verification section). v1.7.1 removes the false "PTP step" reseed for stalls ≤100 ms. Still open: what makes the host stall. Candidates: real-time scheduling/preemption (`aes67-tx` runs at nice −10, not SCHED_FIFO; the DAB/dab-scripts and `odr-audioenc` compete for the same cores) and D-state/NFS (load average ~6 while 88% idle); the stream watchdog's promiscuous-mode flapping was removed in the same deployment (~45/min → 0/min).
-2. **Salland1 input stalls.** Two 10 s underrun restarts occurred on 2026-10-27. `-U 10` handled them correctly, but the upstream cause was not identified.
+1. **Host-side stalls** were the real cause of the reseed events — not grandmaster steps (see the verification section). v1.7.1 removed the false "PTP step" reseed for stalls ≤100 ms, and the week after deployment showed 1 reseed instead of ~1.5/day. Two things remain open: (a) *what* makes the host stall — candidates are real-time scheduling/preemption (`aes67-tx` runs at nice −10, not SCHED_FIFO; the DAB/dab-scripts and `odr-audioenc` compete for the same cores) and D-state/NFS (load average ~6 while 88% idle); (b) the one remaining reseed of 2026-11-04 04:20:37 (+44.7 ms) had no PTP event either and was seen only by the Salland1 process, so a short backward PHC excursion or a preemption inside the detector window still slips past the catch-up — instrument this in v1.7.2 (log the emit lag at reseed time; catch up instead of reseeding when the loop is behind schedule).
+2. **Salland1 input stalls.** Two 10 s underrun restarts on 2026-10-27, again on 2026-11-03 09:19 and 2026-11-04 22:19. `-U 10` plus systemd handled every one correctly and Liquidsoap reconnected, but the upstream cause (HTTP/FLAC delivery) was not identified.
 3. **Audio-level watchdog not implemented.** The packet watchdog and underrun timeout cover a dead pipe, but not the case where the decoder keeps sending *silent* PCM with valid packet timing.
 4. **Residual Late spikes / relay clock.** 1Zwolle's unbuffered relay peaks at ~15 ms and its media clock advances on *received* packets, so receive gaps and bursts modulate the RTP timestamps directly (the +34/−26 ms reseed pair on 2026-10-27 21:29 was exactly this). Planned v1.7.2: anchor the relay clock on the PHC with a small jitter buffer (or a 1–2 ms timestamp lead), tested on a scratch group first. Steady-state arrival is clean: 1000 pps, intervals 0.72–1.61 ms.
 5. **1Zwolle AES67 relay** runs the same 1.7.1 binary; its webstream Liquidsoap service remains separate and unchanged.
@@ -116,11 +138,13 @@ Dante gives AES67 flows a fixed 2 ms latency budget; DVS can use its 5 ms settin
 Start the next workspace by re-reading this file and the README, then verify the current
 service/version and PTP offsets before changing anything. The first priorities are:
 
-- watch `journalctl` for about a week: the reseed bursts should stop; only a real stall >100 ms
-  should now show `media clock resynced (+100.0 ms of …)`, and the promiscuous-mode kernel spam
-  should stay gone (0/min measured right after deployment);
-- identify the host-side stalls (scheduling vs D-state vs NIC), because those are the real
-  cause of any remaining discontinuity;
-- then anchor the relay clock on the PHC (v1.7.2, small jitter buffer) — this also addresses
-  the residual Late spikes; test on a non-production group first;
+- week check done on 2026-11-05: reseed bursts stopped (1 in 7.6 days, relay silent), 0 bounded
+  resyncs, promiscuous-mode traffic stayed at 0/min; the upstream underrun restarts (3 and 4 Nov)
+  recovered by themselves;
+- v1.7.2 candidates, in order: (a) instrument the reseed decision (log the emit lag; catch up
+  instead of reseeding when the loop is behind schedule) so the last unexplained +44.7 ms event
+  can be classified; (b) anchor the relay clock on the PHC with a small jitter buffer, which also
+  addresses the residual Late spikes — test on a non-production group first;
+- identify the host-side stalls (scheduling vs D-state vs NIC), because those remain the only
+  source of discontinuities;
 - add an audio-level watchdog if silent-PCM failures matter.
