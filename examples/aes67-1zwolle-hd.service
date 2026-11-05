@@ -11,7 +11,12 @@ Wants=network-online.target
 [Service]
 Type=simple
 Nice=-10
-ExecStart=/usr/local/bin/aes67-tx -k 0x6a95A512 -A 239.192.19.137 -P 5004 -a 239.69.100.1 -p 5004 -f eno1
+# --relay-buffer 4 enables the paced relay (v1.7.2): received packets are held in
+# a 4 ms jitter buffer and emitted on PTP slots, so arrival jitter from the
+# source/network no longer shows up as "Late" spikes on the receiver.  4 ms is the
+# extra program latency; use 2 ms for minimum latency or 8-10 ms on a jittery
+# network.  Omit the flag for the legacy arrival-paced relay.
+ExecStart=/usr/local/bin/aes67-tx -k 0x6a95A512 -A 239.192.19.137 -P 5004 -a 239.69.100.1 -p 5004 -f eno1 --relay-buffer 4 -v
 Restart=always
 RestartSec=3
 

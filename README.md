@@ -119,8 +119,13 @@ sudo ./aes67-tx \
 -b, --bit <16|24>          PCM bits per sample for --raw      (default 24)
 -C, --channels <n>         channels for --raw                 (default 2)
 -n, --pkt <frames>         frames per RTP packet for --raw    (default 48 = 1 ms)
--J, --jitter <pkts>        input ring capacity for --raw      (default 32 = 32 ms)
--L, --latency <ms>         target buffer latency for --raw   (default 0 = half of -J)
+-J, --jitter <pkts>        ring capacity in packets            (raw default 32 = 32 ms,
+                                                                paced relay default 512)
+-L, --latency <ms>         target buffer latency              (raw default 0 = half of -J;
+                                                                paced relay default 4 ms)
+-U, --underrun-exit <s>    exit after N s of raw-buffer underrun (default 0 = off)
+   --relay-buffer <ms>     paced relay: jitter-buffer target in ms instead of
+                           forwarding on packet arrival          (default 0 = off)
 -v, --verbose              log progress to stderr
 -h, --help                 show help
 ```
@@ -195,7 +200,7 @@ ffmpeg -hide_banner -loglevel error -reconnect 1 -reconnect_streamed 1 -reconnec
   it the sender happily transmits silent zero packets forever, so a packet watchdog sees
   "healthy" traffic. Use `-U 10` for an internet-fed service; systemd then restarts the chain.
 
-### Media-clock PLL, emitter stalls and PTP steps (v1.7.0 / v1.7.1)
+### Media-clock PLL, emitter stalls and PTP steps (v1.7.0 – v1.7.2)
 
 The media clock is seeded from the PTP hardware clock once and then advanced by exact sample
 counts. An offset between the RTP timestamp and the PHC therefore means one of two things: the
@@ -204,7 +209,7 @@ path), or the clock really **stepped** (grandmaster reboot, VertoMX/clock reconf
 switch hiccup). A Dante receiver reports either as a "Late" offset and may mute the channel
 until it is corrected.
 
-Since **v1.7.1** the sender distinguishes them as far as it can:
+Since **v1.7.1 / v1.7.2** the sender distinguishes them as far as it can:
 
 - **Stalls up to 100 ms** (`MAX_CATCHUP_S`) are caught up: the sender keeps its emit schedule
   and sends the backlog immediately, so the media clock stays locked to the PHC and the RTP
@@ -224,19 +229,47 @@ Since **v1.7.1** the sender distinguishes them as far as it can:
 - **A real PTP step** — or any offset that survives the catch-up — is corrected in place every
   250 packets when the absolute RTP↔PHC difference exceeds **20 ms**:
 
-      media clock off PHC by -9.0 ms - hard reseed (long stall or PTP step)
+      media clock off PHC by -9.0 ms - hard reseed (long stall or PTP step; emit lag +0.2 ms)
+
+  Since v1.7.2 the reseed decision also looks at the **emit lag**: when the loop itself is behind
+  its PHC slot, the offset is an emitter stall and the catch-up above handles it — no reseed, and
+  the log (with `-v`) says `media clock behind PHC by ... - catching up (no reseed)`. Only an
+  offset that persists *while the emitter is on schedule* is a clock step worth reseeding.
 
   The RTP timestamp gets a short discontinuity, but the service, the Liquidsoap input and the
   ASRC buffer keep running; the receiver re-locks within a few packets. This is deliberately an
-  in-process correction (no service restart, no stream reconnect). In the relay path the text is
-  `...(receive gap/burst or PTP step)`, because the relay clock advances on *received* packets:
-  a receive gap leaves it behind the PHC and the following burst leaves it ahead. Anchoring the
-  relay clock on the PHC with a small jitter buffer is still an open item (see STATUS.md).
+  in-process correction (no service restart, no stream reconnect).
 - `--keep-ts` disables the check, because forwarded source timestamps are not necessarily
   PHC-referenced.
 
+### Paced relay with a jitter buffer (`--relay-buffer`, v1.7.2, opt-in)
+
+A relay that forwards on packet arrival makes its *output timing* inherit the source's arrival
+jitter: with a steady 1 ms/1000 pps source the intervals are 0.72–1.61 ms, but a switch or
+network hiccup shows up directly as "Late" spikes on the receiver (0.016 % of packets, peaks
+~15 ms in October 2026).
+
+`--relay-buffer <ms>` switches the relay to the same paced model as `--raw`: received packets
+queue in a jitter buffer and are emitted on PHC slots, with the media clock advanced by exact
+sample counts and slewed to the PHC. The output pacing then no longer follows the arrival
+pattern. The buffer depth is the extra program latency; `-J` sets its capacity in packets.
+
+- A slow, bounded controller (±200 ppm) trims the emit period so the buffer stays at its target
+  despite the source's own clock drift — a relay never resamples, it only adjusts *when* the
+  next packet leaves.
+- A hard latency ceiling (8× the target) bounds the added latency after a burst; beyond that the
+  oldest packets are dropped and counted (`dropped=` in the log).
+- **On underrun nothing is sent.** A relay must never fabricate silence or duplicate audio into a
+  live program; the media clock keeps running on the PHC so the receiver sees a gap instead of a
+  clock error. The log counts skipped slots (`relay underrun: buffer empty (N slots skipped)`).
+
+Measured on the production Stereo Tool source (November 2026, scratch group, 4 ms buffer): fill
+steady at 3–4 ms, RTP↔PHC offset ≈ +0.1 ms, 0 drops, 0 underruns, and output intervals
+0.75–1.27 ms instead of the arrival-driven 0.72–1.61 ms with rare 15 ms spikes.
+
 `tools/media-clock-stall-test.sh` reproduces the stall cases on a scratch multicast group
-(`SIGSTOP`/`SIGCONT` on a private sender and relay) without touching the production flows.
+(`SIGSTOP`/`SIGCONT` on a private sender and relay) without touching the production flows, and
+also exercises the paced relay (`RELAY_BUFFER=4` by default).
 
 ### Output interface
 
@@ -432,6 +465,16 @@ own once the upstream returns — no watchdog needed there.
 
 ## Version history
 
+- **1.7.2** — the reseed decision now also looks at the **emit lag**: an offset that exists while
+  the emitter itself is behind its PHC slot is an emitter stall, so the catch-up handles it and no
+  reseed is fired (`media clock behind PHC by ... - catching up (no reseed)`); the reseed log now
+  includes the emit lag and the relay logs its RTP↔PHC offset and PLL slew every second. New
+  opt-in **paced relay** (`--relay-buffer <ms>`): received packets queue in a jitter buffer and
+  are emitted on PHC slots with the media clock anchored on the PHC, a bounded (±200 ppm)
+  fill controller that absorbs the source's clock drift, a hard latency ceiling and no fabricated
+  audio on underrun. Measured on the live Stereo Tool source: output intervals 0.75–1.27 ms
+  instead of arrival-driven 0.72–1.61 ms with ~15 ms spikes, fill 3–4 ms, 0 drops/underruns. The
+  stall test tool now also exercises the paced relay and its output pacing.
 - **1.7.1** — the "PTP step" detector no longer fires on local emitter stalls. A stall ≤100 ms
   is caught up (emit schedule kept, timestamps stay continuous) instead of leaving the media
   clock permanently behind the PHC; a longer stall is resynchronised in one bounded jump

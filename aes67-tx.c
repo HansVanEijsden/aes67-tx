@@ -66,7 +66,7 @@
 #include <net/if.h>
 
 #define PROGRAM   "aes67-tx"
-#define VERSION   "1.7.1"
+#define VERSION   "1.7.2"
 
 /* POSIX clock number of a PTP hardware clock (PHC), as used by linuxptp.
  * It is the same magic value for every /dev/ptpN; the kernel resolves it to
@@ -110,6 +110,8 @@ typedef struct {
                                 (half of the -J capacity).  The adaptive resampler
                                 holds the input buffer at this fill level. */
     int    underrun_exit;    /* exit after N seconds of raw underrun (0=off) */
+    int    relay_buffer_ms;  /* paced relay: jitter-buffer target in ms
+                                (0 = legacy: forward on packet arrival) */
     int    verbose;          /* log progress                     */
 } cfg_t;
 
@@ -160,6 +162,12 @@ static void usage(const char *prog)
         "  -U, --underrun-exit <s>   exit after N seconds of raw-buffer underrun\n"
         "                            (default 0 = off).  Use ~10 so systemd restarts\n"
         "                            the pipeline if the decoder stops delivering PCM.\n"
+        "      --relay-buffer <ms>   paced relay: buffer received RTP packets and emit\n"
+        "                            them on PTP slots instead of on packet arrival\n"
+        "                            (default 0 = off, i.e. forward immediately).\n"
+        "                            Trades <ms> of program latency for even output\n"
+        "                            timing, which removes arrival-jitter 'Late'\n"
+        "                            spikes; -J sets the buffer capacity in packets.\n"
         "\n"
         "Other\n"
         "  -v, --verbose             log progress to stderr\n"
@@ -215,6 +223,26 @@ static long ptp_media_diff(int rate, uint32_t media_ts)
     if (d > 2147483648.0) d -= 4294967296.0;
     if (d < -2147483648.0) d += 4294967296.0;
     return (long)llround(d);
+}
+
+/* Validate an RTP v2 packet and locate its payload.  Returns the payload offset
+ * (>= 0) and sets *plen, or -1 if the packet is unusable.  Payloads larger than
+ * max_payload are rejected so callers can copy into a fixed buffer safely. */
+static int rtp_payload_offset(const unsigned char *p, int n, int *plen, int max_payload)
+{
+    if (n < 12) return -1;
+    if ((p[0] >> 6) != 2) return -1;                 /* RTP v2 only */
+    int hdr = 12 + 4 * (p[0] & 0x0f);                /* 12 + CSRC count */
+    if (p[0] & 0x10) {                               /* header extension */
+        if (n < hdr + 4) return -1;
+        unsigned len = ((unsigned)p[hdr+2] << 8) | p[hdr+3];
+        hdr += 4 + 4 * (int)len;
+    }
+    if (hdr >= n) return -1;
+    int l = n - hdr;
+    if (l <= 0 || l > max_payload) return -1;
+    *plen = l;
+    return hdr;
 }
 
 /* resolve an interface name to its IPv4 address (0.0.0.0 if not found). */
@@ -347,7 +375,7 @@ int main(int argc, char **argv)
     c.in_port = 5004; c.out_port = 5004; c.pt = 96; c.ttl = 8;
     c.sr_interval = 1; c.ssrc = 0; c.rate = 48000; c.iface[0] = 0;
     c.bitdepth = 24; c.channels = 2; c.pkt = 48; c.raw = 0;
-    c.jbuf = 32;   /* raw input ring capacity (packets); ~32 ms at 48k/48 */
+    c.jbuf = 0;    /* ring capacity (packets); 0 = per-mode default (raw 32, relay 512) */
     c.latency_ms = 0;   /* target buffer latency (ms); 0 = auto = half of jbuf */
     c.underrun_exit = 0; /* 0 = disabled; set via -U for internet-fed pipelines */
     /* Default: re-stamp from the PTP clock. A non-PTP source (e.g. Stereo Tool)
@@ -381,6 +409,7 @@ int main(int argc, char **argv)
         {"jitter",       required_argument, 0, 'J'},
         {"latency",      required_argument, 0, 'L'},
         {"underrun-exit", required_argument, 0, 'U'},
+        {"relay-buffer", required_argument, 0, 1000},
         {"verbose",      no_argument,       0, 'v'},
         {"help",         no_argument,       0, 'h'},
         {0,0,0,0}
@@ -411,6 +440,7 @@ int main(int argc, char **argv)
         case 'J': c.jbuf = atoi(optarg); break;
         case 'L': c.latency_ms = atoi(optarg); break;
         case 'U': c.underrun_exit = atoi(optarg); break;
+        case 1000: c.relay_buffer_ms = atoi(optarg); break;
         case 'v': c.verbose = 1; break;
         case 'h': usage(argv[0]); return 0;
         default : usage(argv[0]); return 1;
@@ -762,7 +792,18 @@ int main(int argc, char **argv)
                 if ((pktcnt % 250) == 0) {
                     long diff = ptp_media_diff(c.rate, ts);
                     long hard_lim = (long)(0.020 * (double)c.rate);
-                    if (llabs(diff) > hard_lim) {
+                    /* > 0: the emit loop is itself behind its PHC slot, i.e. the
+                     * offset is (at least partly) an emitter stall, not a clock
+                     * step.  In that case the catch-up block above sends the
+                     * backlog and keeps the media clock locked; reseeding here
+                     * would turn a stall into an extra timestamp jump. */
+                    double lag = phc_now - target_phc;
+                    if (llabs(diff) > hard_lim && lag > pkt_period) {
+                        if (c.verbose)
+                            fprintf(stderr,
+                                    "media clock behind PHC by %+.1f ms while emitter lags %+.1f ms - catching up (no reseed)\n",
+                                    (double)diff * 1000.0 / (double)c.rate, lag * 1000.0);
+                    } else if (llabs(diff) > hard_lim) {
                         double ps = phc_sec();
                         if (ps > 0) {
                             mts_acc = fmod(ps * (double)c.rate, 4294967296.0);
@@ -770,8 +811,8 @@ int main(int argc, char **argv)
                             base_phc = ps;
                             slot = 0;
                             fprintf(stderr,
-                                    "media clock off PHC by %+.1f ms - hard reseed (long stall or PTP step)\n",
-                                    (double)diff * 1000.0 / (double)c.rate);
+                                    "media clock off PHC by %+.1f ms - hard reseed (long stall or PTP step; emit lag %+.1f ms)\n",
+                                    (double)diff * 1000.0 / (double)c.rate, lag * 1000.0);
                         }
                     } else {
                         /* correct the offset over ~30 s, capped at 500 ppm */
@@ -845,6 +886,216 @@ int main(int argc, char **argv)
         free(sb); free(ib);
     } else {
         /* ---- RTP source input --------------------------------------- */
+        int rbps = c.bitdepth / 8, rnch = c.channels > 0 ? c.channels : 2;
+
+        if (c.restamp && c.relay_buffer_ms > 0) {
+            /* ---- paced relay (v1.7.2, opt-in) ---------------------------
+             * Forwarding on packet arrival makes the output timing inherit the
+             * source's arrival jitter: a receive gap leaves the media clock
+             * behind the PHC, a following burst leaves it ahead, and the
+             * timestamps land wherever the network delivered the packets.
+             * Here received packets queue in a small jitter buffer and are
+             * emitted on PHC slots, exactly like the --raw path, so the output
+             * pacing is even and the media clock is anchored on the PHC.
+             * The buffer depth (--relay-buffer) is the extra program latency.
+             *
+             * A slow controller trims the emit period to hold the buffer fill
+             * at its target: the source (e.g. Stereo Tool) is not necessarily
+             * slaved to the grandmaster, so its ppm-level clock drift would
+             * otherwise fill or drain the buffer over hours.
+             *
+             * On underrun nothing is sent: a relay must never fabricate audio
+             * into a live program.  The media clock keeps running on the PHC,
+             * so the receiver sees a gap instead of a clock error. */
+            int jb = c.jbuf > 0 ? c.jbuf : 512;
+            int target_ms = c.relay_buffer_ms;
+            size_t stride = sizeof out;
+            unsigned char *rbuf = malloc((size_t)jb * stride);
+            int *rlen = malloc((size_t)jb * sizeof *rlen);
+            if (!rbuf || !rlen) { perror("malloc relay buffer"); return 1; }
+            int head = 0, rcount = 0, spp = c.pkt > 0 ? c.pkt : 48, target_pkts = 2;
+            int ceiling = 32;                   /* hard latency bound (packets) */
+            double nom_period = (double)spp / (double)c.rate;
+            double period_ppm = 0.0;            /* emit-period trim, bounded */
+            int started = 0;
+            double next_slot = 0.0, relay_ts_acc = 0.0, relay_slew = 0.0;
+            unsigned long long dropped = 0, underruns = 0;
+            time_t last_under_log = 0;
+
+            while (!g_stop) {
+                struct timespec nowt;
+                clock_gettime(CLOCK_MONOTONIC, &nowt);
+                double now_s = nowt.tv_sec + nowt.tv_nsec / 1e9;
+                double phc_now = phc_sec();
+                if (phc_now < 0) { usleep(1000); continue; }
+
+                /* drain everything the kernel has queued into the ring */
+                for (;;) {
+                    int n = (int)recvfrom(rx, in, sizeof in, MSG_DONTWAIT, NULL, NULL);
+                    if (n < 12) break;
+                    int plen = 0;
+                    int off = rtp_payload_offset(in, n, &plen, (int)stride - 12);
+                    if (off < 0) continue;
+                    if (!started) {
+                        spp = plen / (rbps * rnch);
+                        if (spp <= 0) spp = c.pkt > 0 ? c.pkt : 48;
+                        nom_period = (double)spp / (double)c.rate;
+                        target_pkts = (int)(((double)target_ms / 1000.0) / nom_period + 0.5);
+                        if (target_pkts < 2) target_pkts = 2;
+                        if (target_pkts > jb - 1) target_pkts = jb - 1;
+                        ceiling = target_pkts * 8;
+                        if (ceiling < 16) ceiling = 16;
+                        if (ceiling > jb) ceiling = jb;
+                    }
+                    if (rcount >= ceiling) { head = (head + 1) % jb; rcount--; dropped++; }
+                    int slot = (head + rcount) % jb;
+                    memcpy(rbuf + (size_t)slot * stride, in + off, (size_t)plen);
+                    rlen[slot] = plen;
+                    rcount++;
+                }
+
+                if (!started) {
+                    if (rcount >= target_pkts) {
+                        started = 1;
+                        relay_ts_acc = fmod(phc_sec() * (double)c.rate, 4294967296.0);
+                        next_slot = phc_now;
+                        if (c.verbose)
+                            fprintf(stderr,
+                                    "  relay: %d ms jitter buffer (%d x %d frames, capacity %d pkts)\n",
+                                    target_ms, target_pkts, spp, jb);
+                    } else {
+                        usleep(500);
+                        continue;
+                    }
+                }
+
+                /* bounded catch-up: same rule as the raw path (v1.7.1) */
+                if (phc_now - next_slot > MAX_CATCHUP_S) {
+                    double missed = phc_now - next_slot;
+                    double jump = missed > MAX_CATCHUP_S ? MAX_CATCHUP_S : missed;
+                    relay_ts_acc += jump * (double)c.rate;
+                    relay_slew = 0.0;
+                    fprintf(stderr,
+                            "media clock resynced (+%.1f ms of %.1f ms) - relay stalled longer than %.0f ms\n",
+                            jump * 1000.0, missed * 1000.0, MAX_CATCHUP_S * 1000.0);
+                    next_slot = phc_now;
+                }
+
+                if (phc_now >= next_slot) {
+                    uint32_t ts = 0;
+                    double period = nom_period * (1.0 + period_ppm * 1e-6);
+                    if (rcount > 0) {
+                        int plen = rlen[head];
+                        ts = (uint32_t)relay_ts_acc;
+                        out[0]=0x80; out[1]=(unsigned char)(c.pt & 0x7f);
+                        out[2]=(seq>>8)&0xff; out[3]=seq&0xff;
+                        out[4]=(ts>>24)&0xff; out[5]=(ts>>16)&0xff; out[6]=(ts>>8)&0xff; out[7]=ts&0xff;
+                        out[8]=(ssrc>>24)&0xff; out[9]=(ssrc>>16)&0xff; out[10]=(ssrc>>8)&0xff; out[11]=ssrc&0xff;
+                        memcpy(out+12, rbuf + (size_t)head * stride, (size_t)plen);
+                        if (sendto(tx, out, 12+plen, 0, (struct sockaddr *)&txa, sizeof txa) < 0) {
+                            if (c.verbose && errno != EAGAIN) perror("sendto");
+                        }
+                        head = (head + 1) % jb; rcount--;
+                        seq++; lastts = ts; pktcnt++; octet += (uint64_t)plen;
+                        relay_ts_acc += (double)spp + relay_slew;
+
+                        /* slow fill controller (once per second): trim the emit
+                         * period so the buffer stays at its target.  The trim is
+                         * a rate, not a pitch change - a relay never resamples. */
+                        if ((pktcnt % 1000) == 0) {
+                            /* deadband: the fill is quantised in whole packets, so
+                             * only correct when it is more than one packet off target
+                             * (otherwise the integrator would wind up on a 3-vs-4
+                             * difference and trim the rate for no reason) */
+                            int d = rcount - target_pkts;
+                            double err = (d > 1 || d < -1) ? (double)d / (double)target_pkts : 0.0;
+                            if (err > 2.0) err = 2.0;
+                            if (err < -2.0) err = -2.0;
+                            period_ppm += -50.0 * err;
+                            if (period_ppm > 200.0) period_ppm = 200.0;
+                            if (period_ppm < -200.0) period_ppm = -200.0;
+                        }
+
+                        /* media-clock PLL: same policy as the raw path */
+                        if ((pktcnt % 250) == 0) {
+                            long diff = ptp_media_diff(c.rate, lastts);
+                            long hard_lim = (long)(0.020 * (double)c.rate);
+                            double lag = phc_now - next_slot;
+                            if (llabs(diff) > hard_lim && lag > nom_period) {
+                                if (c.verbose)
+                                    fprintf(stderr,
+                                            "media clock behind PHC by %+.1f ms while emitter lags %+.1f ms - catching up (no reseed)\n",
+                                            (double)diff * 1000.0 / (double)c.rate, lag * 1000.0);
+                            } else if (llabs(diff) > hard_lim) {
+                                double ps = phc_sec();
+                                if (ps > 0) {
+                                    relay_ts_acc = fmod(ps * (double)c.rate, 4294967296.0);
+                                    relay_slew = 0.0;
+                                    next_slot = ps;
+                                    fprintf(stderr,
+                                            "media clock off PHC by %+.1f ms - hard reseed (receive gap/burst or PTP step; emit lag %+.1f ms)\n",
+                                            (double)diff * 1000.0 / (double)c.rate, lag * 1000.0);
+                                }
+                            } else {
+                                double target_slew = (double)diff * (double)spp / ((double)c.rate * 30.0);
+                                double max_slew = 500e-6 * (double)spp;
+                                if (target_slew > max_slew) target_slew = max_slew;
+                                if (target_slew < -max_slew) target_slew = -max_slew;
+                                relay_slew = target_slew;
+                            }
+                        }
+                    } else {
+                        /* buffer empty: keep the clock on the PHC, send nothing */
+                        underruns++;
+                        relay_ts_acc += (double)spp;
+                        ts = (uint32_t)relay_ts_acc;
+                        if (c.verbose) {
+                            time_t nu = time(NULL);
+                            if (nu != last_under_log) {
+                                last_under_log = nu;
+                                fprintf(stderr, "relay underrun: buffer empty (%llu slots skipped)\n",
+                                        underruns);
+                            }
+                        }
+                    }
+                    next_slot += period;
+
+                    time_t now = time(NULL);
+                    if (c.sr_interval > 0 && pktcnt > 0 && now != lastSR) {
+                        lastSR = now; send_sr(tx,&txa,ssrc,pktcnt,octet,lastts);
+                    }
+                    if (c.verbose && now != lastLog) {
+                        lastLog = now;
+                        double pc = phc_sec();
+                        double off = 0.0;
+                        if (pc > 0) {
+                            double phcts = fmod(pc * (double)c.rate, 4294967296.0);
+                            off = phcts - (double)lastts;
+                            if (off > 2147483648.0) off -= 4294967296.0;
+                            if (off < -2147483648.0) off += 4294967296.0;
+                        }
+                        fprintf(stderr,
+                                "seq=%u ts=%u pkt=%llu fill=%d/%d ms offset=%+.3f ms trim=%+.0f ppm slew=%+.1f ppm underruns=%llu dropped=%llu\n",
+                                seq, ts, (unsigned long long)pktcnt,
+                                (int)((double)rcount * nom_period * 1000.0), target_ms,
+                                off / (double)c.rate * 1000.0, period_ppm,
+                                relay_slew / (double)spp * 1e6, underruns, dropped);
+                    }
+                    continue;
+                }
+
+                /* wait for the next media-clock slot (precise, like the raw path) */
+                double rem = next_slot - phc_now;
+                if (rem > nom_period) rem = nom_period;
+                double mono_target = now_s + rem;
+                struct timespec st;
+                st.tv_sec = (time_t)mono_target;
+                st.tv_nsec = (long)((mono_target - (double)st.tv_sec) * 1e9);
+                if (st.tv_nsec > 999999999L) st.tv_nsec = 999999999L;
+                clock_nanosleep(CLOCK_MONOTONIC, TIMER_ABSTIME, &st, NULL);
+            }
+            free(rbuf); free(rlen);
+        } else {
         struct pollfd pf; pf.fd = rx; pf.events = POLLIN;
         double relay_ts_acc = 0.0;                  /* fractional, PHC-seeded relay clock */
         double relay_slew = 0.0;                    /* PLL: extra samples per source packet */
@@ -899,8 +1150,9 @@ int main(int argc, char **argv)
              * leaves it behind the PHC and an incoming burst leaves it ahead:
              * that offset is corrected here, but it is an arrival-timing effect,
              * not necessarily a grandmaster step (hence the honest log text).
-             * Anchoring the relay clock on the PHC with a small jitter buffer
-             * instead of on packet arrival is still open (see STATUS.md). */
+             * The opt-in --relay-buffer mode above anchors the clock on the PHC
+             * with a jitter buffer; this arrival-paced path stays the default
+             * until that mode has proven itself in production. */
             if (c.restamp && (pktcnt % 250) == 0) {
                 long diff = ptp_media_diff(c.rate, lastts);
                 long hard_lim = (long)(0.020 * (double)c.rate);
@@ -928,8 +1180,21 @@ int main(int argc, char **argv)
             if (c.sr_interval > 0 && now != lastSR) { lastSR = now; send_sr(tx,&txa,ssrc,pktcnt,octet,lastts); }
             if (c.verbose && now != lastLog) {
                 lastLog = now;
-                fprintf(stderr, "seq=%u ts=%u pkt=%llu\n", seq, ts, (unsigned long long)pktcnt);
+                double pc = phc_sec();
+                double off = 0.0;
+                if (pc > 0) {
+                    double phcts = fmod(pc * (double)c.rate, 4294967296.0);
+                    off = phcts - (double)lastts;
+                    if (off > 2147483648.0) off -= 4294967296.0;
+                    if (off < -2147483648.0) off += 4294967296.0;
+                }
+                fprintf(stderr,
+                        "seq=%u ts=%u pkt=%llu offset=%+.3f ms slew=%+.1f ppm (arrival-paced)\n",
+                        seq, ts, (unsigned long long)pktcnt,
+                        off / (double)c.rate * 1000.0,
+                        relay_slew / (double)relay_spp * 1e6);
             }
+        }
         }
     }
 
