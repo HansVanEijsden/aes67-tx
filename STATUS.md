@@ -1,7 +1,7 @@
 # aes67-tx — operational status
 
-**Last verified:** 2026-11-05 16:03 (Europe/Amsterdam)  
-**Current version:** 1.7.2 (deployed 2026-11-05 16:00; see the deployment section below)  
+**Last verified:** 2026-11-07 11:13 (Europe/Amsterdam)  
+**Current version:** 1.7.3 (deployed 2026-11-07 11:10; see the section below)  
 **Repository:** public — this file deliberately contains no secrets, credentials, host/IP addresses, PTP grandmaster identifiers, stream URLs or private network details. Operational runbooks remain in the private infrastructure documentation.
 
 ## Current production state
@@ -10,8 +10,8 @@ One Linux host acts as a PTP slave of the Dante/AES67 grandmaster and publishes 
 
 | Flow | Source | Mode | Status |
 |---|---|---|---|
-| 1Zwolle HD | Stereo Tool AES67 / LiveWire | **paced relay** (`--relay-buffer 4`), media clock anchored on the PHC | `1.7.2`, up since 2026-11-05 16:00 (deployment restart) |
-| Salland1 HD | Salland1 HTTP/FLAC stream | Liquidsoap → raw 24-bit PCM → `aes67-tx --raw` | `1.7.2`, up since 2026-11-05 16:00 (deployment restart) |
+| 1Zwolle HD | Stereo Tool AES67 / LiveWire | **paced relay** (`--relay-buffer 8`), media clock anchored on the PHC | `1.7.3`, up since 2026-11-07 11:09:56 (deployment restart) |
+| Salland1 HD | Salland1 HTTP/FLAC stream | Liquidsoap → raw 24-bit PCM → `aes67-tx --raw` | `1.7.3`, up since 2026-11-07 11:10:02 (deployment restart) |
 
 The Salland1 chain:
 
@@ -127,6 +127,30 @@ and `/etc/systemd/system/aes67-1zwolle-hd.service.1.7.1.bak`.
 The paced relay adds 4 ms of program latency on the 1Zwolle chain; `-L`/`--relay-buffer` accepts
 2 ms for minimum latency or 8–10 ms on a jittery network.
 
+### v1.7.2 regression found and fixed (2026-11-07)
+
+After 1 d 19 h on v1.7.2 the paced relay was **not** behaving: `offset` had drifted to −2.4 ms
+(outside Dante's 2 ms budget), `trim` sat against the ±200 ppm clamp, and 1,606 `relay underrun`
+events (~1 skipped slot per minute) plus 5 drops had accumulated — while the flows themselves kept
+working (0 reseeds, Salland1 flat after one upstream underrun restart on 2026-11-06 00:09).
+
+Cause: the emit-period trim that holds the jitter buffer also leaked into the **media clock**.
+The RTP clock then ran at the trimmed rate and the PLL had to park a static offset of
+`trim × rate × 30 s` to compensate — measured −2.4 ms at −83 ppm, exactly matching the formula —
+and the fill integrator wound up against its clamp because the fill is quantised in whole packets.
+
+v1.7.3 fixes both: the media clock advances with the inverse trim (`spp × (1 + trim)`), so its
+rate is exactly the PHC rate, and the fill controller is proportional (clamped, no windup).
+Buffer depth measured on the live source (3 min each, parallel relays): 4 ms still underran once
+on a >4 ms input gap, 6 ms and 8 ms did not. The unit now runs `--relay-buffer 8`.
+
+After the v1.7.3 deployment (11:10): relay `fill` 8/8 ms, `trim` 0, `slew` ±1 ppm, offset within
+±0.35 ms (mean +0.02 ms), 0 underruns, 0 drops; relay output 1000.1 pps, intervals sd 0.029 ms,
+max 1.51 ms, 0 above the 2 ms budget; Salland1 `fill` ~1000 ms, 0 underruns; no reseeds;
+promiscuous-mode events 0; `portState SLAVE`, `offsetFromMaster` 0.9 µs. Rollback:
+`/usr/local/bin/aes67-tx.1.7.2.bak`, `/usr/local/bin/aes67-tx.1.7.3.bak` and
+`/etc/systemd/system/aes67-1zwolle-hd.service.1.7.1.bak` are on the host.
+
 Measurement after ~3 h 48 min on 2026-10-24:
 
 | Flow | Average latency | Peak | Late packets | Notes |
@@ -161,7 +185,7 @@ Dante gives AES67 flows a fixed 2 ms latency budget; DVS can use its 5 ms settin
 1. **Host-side stalls** were the real cause of the reseed events — not grandmaster steps (see the verification section). v1.7.1 removed the false "PTP step" reseed for stalls ≤100 ms, and the week after deployment showed 1 reseed instead of ~1.5/day. Two things remain open: (a) *what* makes the host stall — candidates are real-time scheduling/preemption (`aes67-tx` runs at nice −10, not SCHED_FIFO; the DAB/dab-scripts and `odr-audioenc` compete for the same cores) and D-state/NFS (load average ~6 while 88% idle); (b) the one remaining reseed of 2026-11-04 04:20:37 (+44.7 ms) had no PTP event either and was seen only by the Salland1 process, so a short backward PHC excursion or a preemption inside the detector window still slips past the catch-up — instrument this in v1.7.2 (log the emit lag at reseed time; catch up instead of reseeding when the loop is behind schedule).
 2. **Salland1 input stalls.** Two 10 s underrun restarts on 2026-10-27, again on 2026-11-03 09:19 and 2026-11-04 22:19. `-U 10` plus systemd handled every one correctly and Liquidsoap reconnected, but the upstream cause (HTTP/FLAC delivery) was not identified.
 3. **Audio-level watchdog not implemented.** The packet watchdog and underrun timeout cover a dead pipe, but not the case where the decoder keeps sending *silent* PCM with valid packet timing.
-4. **Residual Late spikes / relay clock — addressed in v1.7.2.** 1Zwolle's relay now runs paced (`--relay-buffer 4`): the media clock is anchored on the PHC and the jitter buffer smooths the arrival pattern. Measured before/after in 30 s windows: max interval 4.892 → 1.260 ms, sd 0.090 → 0.045 ms, 2 → 0 intervals above the 2 ms Dante budget. Still to decide: whether 4 ms of extra program latency is the right trade (2 ms is possible) and whether the relay should also get an audio-level watchdog.
+4. **Residual Late spikes / relay clock — addressed in v1.7.2/v1.7.3.** 1Zwolle's relay runs paced (`--relay-buffer 8`): the media clock is anchored on the PHC and the jitter buffer smooths the arrival pattern. Measured: max interval 4.892 → 1.51 ms, sd 0.095 → 0.029 ms, 2 → 0 intervals above the 2 ms Dante budget. The 8 ms buffer was chosen after measuring that 4 ms still underran on >4 ms input gaps. Remaining: watch the underrun/drop counters over the coming week and consider an audio-level watchdog for the relay.
 5. **1Zwolle AES67 relay** runs the same 1.7.1 binary; its webstream Liquidsoap service remains separate and unchanged.
 
 ## Next step

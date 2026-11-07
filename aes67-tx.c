@@ -66,7 +66,7 @@
 #include <net/if.h>
 
 #define PROGRAM   "aes67-tx"
-#define VERSION   "1.7.2"
+#define VERSION   "1.7.3"
 
 /* POSIX clock number of a PTP hardware clock (PHC), as used by linuxptp.
  * It is the same magic value for every /dev/ptpN; the kernel resolves it to
@@ -997,23 +997,29 @@ int main(int argc, char **argv)
                         }
                         head = (head + 1) % jb; rcount--;
                         seq++; lastts = ts; pktcnt++; octet += (uint64_t)plen;
-                        relay_ts_acc += (double)spp + relay_slew;
+                        /* Advance the media clock at the PHC rate.  The emit period
+                         * is trimmed by period_ppm to hold the buffer, so the
+                         * per-packet advance must carry the *inverse* of that trim:
+                         *   media_rate = spp*(1+trim) / (nom*(1+trim)) = rate.
+                         * Without this the trim leaks into the RTP clock and the PLL
+                         * has to park a static offset of trim*rate*30 s (observed
+                         * -2.4 ms at -83 ppm) - outside Dante's 2 ms budget. */
+                        relay_ts_acc += (double)spp * (1.0 + period_ppm * 1e-6) + relay_slew;
 
                         /* slow fill controller (once per second): trim the emit
                          * period so the buffer stays at its target.  The trim is
                          * a rate, not a pitch change - a relay never resamples. */
                         if ((pktcnt % 1000) == 0) {
-                            /* deadband: the fill is quantised in whole packets, so
-                             * only correct when it is more than one packet off target
-                             * (otherwise the integrator would wind up on a 3-vs-4
-                             * difference and trim the rate for no reason) */
+                            /* Proportional fill control: hold the buffer at its target
+                             * by trimming the emit period a little.  The fill is
+                             * quantised in whole packets, so clamp the error and keep
+                             * the gain small; a proportional law settles with a fill
+                             * offset of only a few packets instead of winding up
+                             * against the clamp like the old integrator did. */
                             int d = rcount - target_pkts;
-                            double err = (d > 1 || d < -1) ? (double)d / (double)target_pkts : 0.0;
-                            if (err > 2.0) err = 2.0;
-                            if (err < -2.0) err = -2.0;
-                            period_ppm += -50.0 * err;
-                            if (period_ppm > 200.0) period_ppm = 200.0;
-                            if (period_ppm < -200.0) period_ppm = -200.0;
+                            if (d > 4) d = 4;
+                            if (d < -4) d = -4;
+                            period_ppm = -25.0 * (double)d;
                         }
 
                         /* media-clock PLL: same policy as the raw path */

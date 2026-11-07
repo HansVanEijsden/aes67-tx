@@ -263,9 +263,11 @@ pattern. The buffer depth is the extra program latency; `-J` sets its capacity i
   live program; the media clock keeps running on the PHC so the receiver sees a gap instead of a
   clock error. The log counts skipped slots (`relay underrun: buffer empty (N slots skipped)`).
 
-Measured on the production Stereo Tool source (November 2026, scratch group, 4 ms buffer): fill
-steady at 3–4 ms, RTP↔PHC offset ≈ +0.1 ms, 0 drops, 0 underruns, and output intervals
-0.75–1.27 ms instead of the arrival-driven 0.72–1.61 ms with rare 15 ms spikes.
+Measured on the production Stereo Tool source (November 2026, scratch groups): fill steady at its
+target, `trim` 0, `slew` ±1 ppm, RTP↔PHC offset within ±0.35 ms, 0 drops, 0 underruns, and output
+intervals sd 0.029 ms / max 1.51 ms instead of the arrival-driven sd 0.095 ms / max 4.93 ms.
+Buffer depth: the 4 ms target still underran once on an occasional >4 ms input gap, 6 and 8 ms
+did not — 8 ms is used in production (that is the added program latency; 2 ms is the minimum).
 
 `tools/media-clock-stall-test.sh` reproduces the stall cases on a scratch multicast group
 (`SIGSTOP`/`SIGCONT` on a private sender and relay) without touching the production flows, and
@@ -465,6 +467,16 @@ own once the upstream returns — no watchdog needed there.
 
 ## Version history
 
+- **1.7.3** — fix in the paced relay (v1.7.2): the emit-period trim used to hold the jitter buffer
+  leaked into the **media clock**, so the RTP clock ran at the trimmed rate and the PLL had to
+  park a static offset of `trim × rate × 30 s` — measured −2.4 ms at −83 ppm after 43 h, outside
+  Dante's 2 ms budget — while the fill integrator wound up against its clamp and produced ~1
+  skipped slot per minute. The media clock now advances with the **inverse trim**
+  (`spp × (1 + trim)`), so it stays exactly on the PHC, and the fill controller is proportional
+  instead of integrating. Measured after the fix: fill at target, `trim` 0, `slew` ±1 ppm, offset
+  within ±0.35 ms, 0 underruns. Buffer-depth check on the live source (3 min each): 4 ms still
+  underran once on a >4 ms input gap, 6 ms and 8 ms did not — production now runs
+  `--relay-buffer 8`, output intervals sd 0.029 ms / max 1.51 ms / 0 above the 2 ms budget.
 - **1.7.2** — the reseed decision now also looks at the **emit lag**: an offset that exists while
   the emitter itself is behind its PHC slot is an emitter stall, so the catch-up handles it and no
   reseed is fired (`media clock behind PHC by ... - catching up (no reseed)`); the reseed log now
