@@ -1,6 +1,6 @@
 # aes67-tx — operational status
 
-**Last verified:** 2026-11-07 11:13 (Europe/Amsterdam)  
+**Last verified:** 2026-11-09 13:38 (Europe/Amsterdam)  
 **Current version:** 1.7.3 (deployed 2026-11-07 11:10; see the section below)  
 **Repository:** public — this file deliberately contains no secrets, credentials, host/IP addresses, PTP grandmaster identifiers, stream URLs or private network details. Operational runbooks remain in the private infrastructure documentation.
 
@@ -22,15 +22,19 @@ The Salland1 chain:
 
 The 1Zwolle HD relay and the Salland1 receiver share the same binary and PTP PLL. The 1Zwolle **webstream** Liquidsoap service is a separate production chain and was not touched during this work.
 
-GitHub releases exist for **v1.5.0 through v1.7.1**; v1.7.1 is the latest. The releases provide source archives only (no binary assets). Documentation-only commits use `[no release]` and do not trigger a new release.
+GitHub releases exist for **v1.5.0 through v1.7.3**; v1.7.3 is the latest. The releases provide source archives only (no binary assets). Documentation-only commits use `[no release]` and do not trigger a new release.
 
 ## Current health
 
-Latest measured production values (2026-11-05 15:46):
+Latest measured production values (2026-11-09 13:38):
 
-- Salland1 RTP↔PHC offset: **−0.02…+0.02 ms**; PTP `master_offset` −9.1 µs, `offsetFromMaster` 2.6 µs.
-- Salland1 buffer: **1000.0 ms** (target 1000 ms), `corr` **0.0 ppm**, **0 underruns**.
-- Last hard reseed: **2026-11-04 04:20:37** (+44.7 ms, Salland1 only, no PTP event); before that none since the v1.7.1 deployment on 2026-10-28.
+- 1Zwolle relay (paced, 8 ms): RTP↔PHC offset **−0.07…+0.09 ms**, `fill` 8/8 ms, `trim` 0,
+  `slew` ±2 ppm, 0 dropped; output 1000.04 pps, intervals sd 0.049 ms, max 1.17 ms.
+- Salland1: RTP↔PHC offset **−0.02 ms**; buffer **1000.0 ms**, `corr` **0.0 ppm**, **0 underruns**;
+  output 1000.04 pps, intervals sd 0.042 ms, max 1.33 ms.
+- PTP: `portState SLAVE`, `gmPresent` true, `offsetFromMaster` 37 ns, `master_offset` 29 ns.
+- Last hard reseed: **2026-11-04 04:20:37** (v1.7.1 era, Salland1 only, no PTP event); none since
+  the v1.7.2/v1.7.3 deployments.
 
 ## Verification on 2026-10-28 (evening)
 
@@ -150,6 +154,26 @@ max 1.51 ms, 0 above the 2 ms budget; Salland1 `fill` ~1000 ms, 0 underruns; no 
 promiscuous-mode events 0; `portState SLAVE`, `offsetFromMaster` 0.9 µs. Rollback:
 `/usr/local/bin/aes67-tx.1.7.2.bak`, `/usr/local/bin/aes67-tx.1.7.3.bak` and
 `/etc/systemd/system/aes67-1zwolle-hd.service.1.7.1.bak` are on the host.
+
+### 48-hour check on v1.7.3 (2026-11-09 13:38)
+
+Both flows were up continuously for 2 d 2 h 28 min: **0 restarts, 0 hard reseeds, 0 resynchronised
+clocks**, and neither watchdog had anything to do.
+
+- 1Zwolle (paced relay, 8 ms): `fill` 8/8 ms in all 300 samples of the last five minutes,
+  `trim` 0, `slew` ±2 ppm, RTP↔PHC offset **−0.07…+0.09 ms** (mean −0.01 ms), **0 dropped**;
+  output 1000.04 pps, intervals sd 0.049 ms / max 1.17 ms / **0 above the 2 ms Dante budget**.
+- Salland1: `fill` 1000.0 ms, `corr` 0.0 ppm, 0 underruns, offset −0.02 ms; output 1000.04 pps,
+  intervals sd 0.042 ms / max 1.33 ms / 0 above 2 ms. **No upstream underrun exits in 48 h**
+  (the week before had two).
+- PTP: `portState SLAVE`, `gmPresent` true, `offsetFromMaster` 37 ns / `master_offset` 29 ns;
+  promiscuous-mode kernel events 0.
+
+Residual: the relay counted **334 skipped slots** in 48 h (41 log events — about 7 ms of inserted
+silence per hour, i.e. one 1 ms gap every ~70 min), versus ~1,600 events in 43 h with the v1.7.2
+bug (≈44× less). These are source/network gaps longer than the 8 ms buffer: a paced relay cannot
+emit audio that has not arrived. `dropped` stayed 0. A larger buffer (12–16 ms) would reduce them
+further at the cost of program latency; not applied.
 
 Measurement after ~3 h 48 min on 2026-10-24:
 
