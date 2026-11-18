@@ -1,6 +1,6 @@
 # aes67-tx — operational status
 
-**Last verified:** 2026-11-09 13:38 (Europe/Amsterdam)  
+**Last verified:** 2026-11-18 11:48 (Europe/Amsterdam)  
 **Current version:** 1.7.3 (deployed 2026-11-07 11:10; see the section below)  
 **Repository:** public — this file deliberately contains no secrets, credentials, host/IP addresses, PTP grandmaster identifiers, stream URLs or private network details. Operational runbooks remain in the private infrastructure documentation.
 
@@ -26,15 +26,16 @@ GitHub releases exist for **v1.5.0 through v1.7.3**; v1.7.3 is the latest. The r
 
 ## Current health
 
-Latest measured production values (2026-11-09 13:38):
+Latest measured production values (2026-11-18 11:48):
 
-- 1Zwolle relay (paced, 8 ms): RTP↔PHC offset **−0.07…+0.09 ms**, `fill` 8/8 ms, `trim` 0,
-  `slew` ±2 ppm, 0 dropped; output 1000.04 pps, intervals sd 0.049 ms, max 1.17 ms.
-- Salland1: RTP↔PHC offset **−0.02 ms**; buffer **1000.0 ms**, `corr` **0.0 ppm**, **0 underruns**;
-  output 1000.04 pps, intervals sd 0.042 ms, max 1.33 ms.
-- PTP: `portState SLAVE`, `gmPresent` true, `offsetFromMaster` 37 ns, `master_offset` 29 ns.
-- Last hard reseed: **2026-11-04 04:20:37** (v1.7.1 era, Salland1 only, no PTP event); none since
-  the v1.7.2/v1.7.3 deployments.
+- 1Zwolle relay (paced, 8 ms): up **11 d**, 0 restarts; RTP↔PHC offset **−0.08…+0.12 ms**,
+  `fill` 8/8 ms, `trim` 0, `slew` ±2 ppm; output 1000 pps, intervals sd 0.049 ms, max 1.17 ms,
+  0 above the 2 ms budget. `dropped` 37 — all from one source outage (see below).
+- Salland1: **unstable since 2026-11-16** — ~1 pipeline restart per 35–60 min (6 on 16 Nov, 33 on
+  17 Nov, 32 on 18 Nov; `NRestarts` 85). Per restart ~17 s of silence. Cause is in the front-end,
+  not in `aes67-tx` (see the 11-day section).
+- PTP: `portState SLAVE`, `gmPresent` true, `offsetFromMaster` 57 ns, `master_offset` 57 ns.
+- Last hard reseed: **2026-11-04 04:20:37** (v1.7.1 era); none since the v1.7.2/v1.7.3 deployments.
 
 ## Verification on 2026-10-28 (evening)
 
@@ -154,6 +155,38 @@ max 1.51 ms, 0 above the 2 ms budget; Salland1 `fill` ~1000 ms, 0 underruns; no 
 promiscuous-mode events 0; `portState SLAVE`, `offsetFromMaster` 0.9 µs. Rollback:
 `/usr/local/bin/aes67-tx.1.7.2.bak`, `/usr/local/bin/aes67-tx.1.7.3.bak` and
 `/etc/systemd/system/aes67-1zwolle-hd.service.1.7.1.bak` are on the host.
+
+### 11-day check (2026-11-18): relay clean, Salland1 front-end degraded
+
+**1Zwolle relay: clean.** Up 11 days, 0 restarts, 0 hard reseeds, 0 resynchronised clocks,
+`fill` 8/8 ms in every sample, offset within ±0.12 ms, output intervals sd 0.049 ms / max 1.17 ms
+/ 0 above the 2 ms budget. `dropped` stayed 0 except for 37 packets from one source outage of
+~137 s somewhere between 2026-11-09 and 2026-11-15 (journal retention is ~3 days, see below), which
+the paced relay absorbed without restarting — exactly the designed behaviour.
+
+**Salland1: degraded since 2026-11-16** (first failure 16 Nov 15:10; 6/33/32 restarts per day on
+16/17/18 Nov, `NRestarts` 85). Signature per event, read from the journal:
+
+1. Liquidsoap stops delivering PCM — the aes67-tx ring drops from ~750 ms to ~1 ms within one
+   second and the underrun counter then advances 1000/s;
+2. after 10 s of that, `-U 10` exits ("raw input underrun for 10 s") and Liquidsoap dies with
+   `Broken pipe` (`pipe_output.ml`), which is the consequence, not the cause;
+3. systemd restarts the chain; ~7 s later PCM flows again. ~17 s of silence per event.
+
+The front-end (Liquidsoap) is the suspect, not `aes67-tx`: during such a stall the 1Zwolle relay
+keeps logging every second, so the host itself is fine. The upstream stream tests healthy from this
+host over IPv4 (5 min at ~1.03 Mbps, one second below 5 KB/s; ping 0 % loss, 11–48 ms), the TCP
+socket for the stream shows reordering/retransmits (`rcv_ooopack` 25, `reordering` 37), and IPv6 to
+the stream host is unreachable (fails within 1 ms; the chain connects over IPv4). Liquidsoap 2.4.6
+`input.http` is a blocking source, so a TCP stall freezes its clock and therefore the output.
+
+Candidate fixes (not applied yet): raise `-U 10` → `-U 30` so a transient stall no longer kills the
+pipeline; make the front-end non-blocking/buffered (Liquidsoap `timeout`/`on_error`, or an
+independent ffmpeg feeder with reconnect); investigate the upstream path (reordering since
+~15–16 Nov); and raise the journal retention.
+
+**Journal retention is only ~3 days** (~490 MB, default settings): the two AES67 units write ~63k
+lines/day each because of `-v`, so post-mortems have a very short window.
 
 ### 48-hour check on v1.7.3 (2026-11-09 13:38)
 
