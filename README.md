@@ -161,7 +161,7 @@ s = mksafe(input.http("https://radio.example.org/station-flac",
 output.external(
   %wav(header=false, samplerate=48000, channels=2, samplesize=24),
   "/usr/local/bin/aes67-tx --raw -k 0x6a95A511 -a 239.69.100.2 -p 5004 \
-     -f eno1 -b 24 -C 2 -n 48 -J 3072 -L 1000 -t 96 -l 8",
+     -f eno1 -b 24 -C 2 -n 48 -J 30720 -L 10000 -U 30 -t 96 -l 8",
   s, self_sync=true)
 ```
 
@@ -170,7 +170,7 @@ A pipe from `ffmpeg` works too (ffmpeg scales 16-bit audio to 24-bit automatical
 ```sh
 ffmpeg -hide_banner -loglevel error -reconnect 1 -reconnect_streamed 1 -reconnect_delay_max 5 \
   -i "https://example.org/station" -vn -f s24le -ar 48000 -ac 2 - \
-  | aes67-tx --raw -a 239.69.100.2 -p 5004 -f eth0 -b 24 -C 2 -n 48 -J 3072 -L 1000 -v
+  | aes67-tx --raw -a 239.69.100.2 -p 5004 -f eth0 -b 24 -C 2 -n 48 -J 30720 -L 10000 -U 30 -v
 ```
 
 - `-b 16`/`-b 24` set the PCM width; the AES67 payload becomes `L16`/`L24` accordingly.
@@ -182,7 +182,8 @@ ffmpeg -hide_banner -loglevel error -reconnect 1 -reconnect_streamed 1 -reconnec
   `%wav(..., samplesize=24)` does the same).
 - `-n 48` = 48 frames/packet (≈1 ms at 48 kHz). Keep the SDP's `a=ptime` in agreement.
 - **`-J <N>`** is the input ring *capacity* in packets (default 32 = 32 ms). Use a large
-  capacity for an internet source, e.g. `-J 3072` ≈ 3 s or `-J 4096` ≈ 4 s.
+  capacity for an internet source: e.g. `-J 30720` ≈ 30 s for a feed that does not have to be
+  live, or `-J 3072` ≈ 3 s for a low-latency feed.
 - **`-L <ms>`** is the target buffer latency (default 0 = half of the `-J` capacity). This is
   the crucial setting for a non-PTP source: the input clock runs on the remote encoder's
   crystal, which drifts a few ppm against the Dante/PTP grandmaster. A fixed-rate pipe would
@@ -190,8 +191,16 @@ ffmpeg -hide_banner -loglevel error -reconnect 1 -reconnect_streamed 1 -reconnec
   uses a **32-tap windowed-sinc adaptive resampler**: a slow PI controller watches the ring
   fill and continuously adjusts the resampling ratio to hold it at the `-L` target. The
   output itself is still PTP-paced, so the receiver stays locked and the latency stays flat.
-  A target of 1000–1500 ms is a good compromise for an internet feed; raise `-L`/`-J` for a
-  more forgiving uplink, lower them for less latency.
+  A target of 1000–1500 ms is a good compromise for a live internet feed. **If the program feed
+  does not need to be live, use a large target instead** (e.g. `-L 10000` with `-J 30720`): the
+  sender then plays out the buffer while a lossy uplink stalls, so a stall shorter than the
+  target costs **no air gap at all** (the program continues from the buffer and the missing
+  passage is simply skipped), a longer stall costs only the excess, and `-U 30` keeps the
+  pipeline alive. The price is ~10 s of program delay and a ~10 s prefill after a restart.
+  Note that the buffer is a *shock absorber*, not a rewind: the adaptive resampler can only
+  refill at a few tenths of a percent (≈10 ms of buffer per second), so after the buffer has
+  been played out it takes many minutes to rebuild. Audio that the uplink lost is gone; the
+  buffer only prevents it from becoming an immediate gap on air.
 - `ffmpeg -reconnect ...` (or Liquidsoap's `input.http`) reconnects over short outages;
   `aes67-tx --raw` exits on upstream EOF so a supervising `systemd` unit (`Restart=always`)
   re-spawns the pipeline for longer drops — together this gives automatic reconnection.
@@ -395,7 +404,8 @@ simultaneously on one host, each on its own multicast group:
   processor / LiveWire) as **L24** AES67 on `239.69.100.1`.
 - `examples/aes67-salland1-hd.service` + `examples/liquidsoap-aes67-salland1.liq` — Liquidsoap
   fetches and decodes a network IceCast/FLAC stream, then feeds `aes67-tx --raw` as **L24**
-  AES67 on `239.69.100.2`, with adaptive resampling (target 1 s, 3 s ring) so clock drift and
+  AES67 on `239.69.100.2`, with adaptive resampling (10 s target, 30 s ring — the program feed is
+  not live; see the `--raw` section) so clock drift and
   network jitter never accumulate. The same flow/SSRC/SDP is reused, so an existing Dante
   Controller subscription needs no change.
 

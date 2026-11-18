@@ -16,7 +16,7 @@ One Linux host acts as a PTP slave of the Dante/AES67 grandmaster and publishes 
 The Salland1 chain:
 
 - Liquidsoap fetches the lossless FLAC stream with `input.http` and writes raw 24-bit PCM via `output.external`.
-- `aes67-tx --raw` options in production: `-J 3072` (3 s ring capacity), `-L 1000` (1 s target), `-U 30` (exit after 30 s of underrun — raised from 10 s on 2026-11-18 because the Salland1 uplink is a known lossy link; see below).
+- `aes67-tx --raw` options in production: `-J 30720` (30 s ring capacity), `-L 10000` (10 s target buffer), `-U 30` (exit after 30 s of underrun). Raised on 2026-11-18 because the Salland1 uplink is a known lossy link and the program feed does not need to be live: the buffer now plays out during upstream stalls instead of turning them into an immediate gap. Program delay is ~11 s end-to-end; the prefill after a restart is ~10 s (the stream watchdog threshold was raised accordingly).
 - The service runs as root in a dedicated systemd unit because `aes67-tx` must open the PTP hardware clock and the multicast socket.
 - The existing `aes67-stream-watchdog` monitors packet presence; `-U 10` covers the separate case where the decoder stays alive but stops delivering PCM.
 
@@ -26,14 +26,17 @@ GitHub releases exist for **v1.5.0 through v1.7.3**; v1.7.3 is the latest. The r
 
 ## Current health
 
-Latest measured production values (2026-11-18 11:48):
+Latest measured production values (2026-11-18 12:00, after the buffer change):
 
 - 1Zwolle relay (paced, 8 ms): up **11 d**, 0 restarts; RTP↔PHC offset **−0.08…+0.12 ms**,
   `fill` 8/8 ms, `trim` 0, `slew` ±2 ppm; output 1000 pps, intervals sd 0.049 ms, max 1.17 ms,
   0 above the 2 ms budget. `dropped` 37 — all from one source outage (see below).
-- Salland1: **unstable since 2026-11-16** — ~1 pipeline restart per 35–60 min (6 on 16 Nov, 33 on
-  17 Nov, 32 on 18 Nov; `NRestarts` 85). Per restart ~17 s of silence. Cause is in the front-end,
-  not in `aes67-tx` (see the 11-day section).
+- Salland1: **degraded since 2026-11-16** because of the lossy upstream link — ~1 pipeline restart
+  per 35–60 min before the 18 Nov changes (6 on 16 Nov, 33 on 17 Nov, 32 on 18 Nov). Now runs a
+  10 s target / 30 s ring (program feed not live) and `-U 30`: upstream stalls below ~10 s cost no
+  air gap. Current run since 11:56: 0 underruns, `fill` climbing to 10 s, RTP↔PHC offset ≈ +0.1 ms.
+  Cause is upstream of `aes67-tx` (known packet loss on the Wijhe link, Butt → Icecast), see the
+  11-day section.
 - PTP: `portState SLAVE`, `gmPresent` true, `offsetFromMaster` 57 ns, `master_offset` 57 ns.
 - Last hard reseed: **2026-11-04 04:20:37** (v1.7.1 era); none since the v1.7.2/v1.7.3 deployments.
 
@@ -193,10 +196,27 @@ Applied 2026-11-18:
 - `-U 10` → **`-U 30`** in `/etc/liquidsoap/aes67-salland1/main.liq` (backup
   `main.liq.bak-20261118`). A stall of up to 30 s is now ridden out (audio gap = uplink stall)
   instead of killing the pipeline (+ ~7 s restart); a genuinely dead decoder is still restarted
-  by systemd after 30 s. Salland1 restarted at 11:53, `fill` 1002.8 ms, 0 underruns.
+  by systemd after 30 s.
+- **Buffer increased**: `-J 3072`/`-L 1000` → **`-J 30720`/`-L 10000`** (30 s capacity, 10 s
+  target; backup `main.liq.bak-before-buffer-20261118`). With the program feed not required to be
+  live, upstream stalls shorter than ~10 s are now played out of the buffer with **no air gap at
+  all**; a longer stall costs only the excess; `-U 30` keeps the pipeline alive. Cost: ~11 s of
+  program delay and a ~10 s prefill after a restart.
+- **Stream watchdog**: `BAD_LIMIT` 3 → **6** (~48 s) in `/usr/local/bin/aes67-stream-watchdog.sh`
+  (backup `aes67-stream-watchdog.sh.bak-20261118`), so it cannot race the 10 s prefill of a
+  service restart; a hung chain is still restarted within about a minute.
 - journald: `SystemMaxUse=2G` in `/etc/systemd/journald.conf` (backup
   `journald.conf.bak-20261118`); at the current log volume that extends retention from ~3 days to
   roughly 12 days. journald restarted, active.
+
+Validation of the buffer change (scratch group, synthetic `--raw` source): with the ring at
+~10 s, stalling the producer for 5 s drained the buffer to ~8 s with **0 underruns** (no gap);
+the adaptive resampler then refills at ≤1 % (≈10 ms/s), so a consumed buffer takes minutes to
+rebuild — that is inherent to not resampling audio audibly. A synthetic 15 s stall exceeded the
+buffer as designed (gap = stall − 10 s); that test's SIGSTOPped ffmpeg did not resume cleanly
+afterwards, so the post-stall refill in production still has to be observed. Salland1 restarted
+at 11:56 with the new settings: 0 underruns, `fill` climbing to 10 s (9592 ms at 12:00), 1Zwolle
+untouched (fill 8/8 ms, offset ~0).
 
 Still open: make the front-end non-blocking/buffered (Liquidsoap `timeout`/`on_error`, or an
 independent ffmpeg feeder with reconnect) so a TCP stall does not freeze the clock at all; and

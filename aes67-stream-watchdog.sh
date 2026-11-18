@@ -17,7 +17,11 @@ SVC="aes67-salland1-hd.service"
 DST="239.69.100.2"
 PORT=5004
 CAPTURE=6        # seconds tcpdump waits for one matching packet
-BAD_LIMIT=3      # restart after this many silent windows (~24 s)
+BAD_LIMIT=6      # restart after this many silent windows (~48 s).  A service
+                 # restart itself now needs ~16 s before the first packet
+                 # (Liquidsoap start + the 10 s PCM prefill), so the threshold
+                 # must sit well above that; a genuinely hung chain is still
+                 # restarted within ~a minute.
 
 bad=0
 while true; do
