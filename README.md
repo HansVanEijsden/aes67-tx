@@ -198,7 +198,9 @@ ffmpeg -hide_banner -loglevel error -reconnect 1 -reconnect_streamed 1 -reconnec
 - **`-U <s>`** makes the raw path exit after N seconds of buffer underrun. This covers the
   nasty failure where the decoder/Liquidsoap keeps running but stops delivering PCM: without
   it the sender happily transmits silent zero packets forever, so a packet watchdog sees
-  "healthy" traffic. Use `-U 10` for an internet-fed service; systemd then restarts the chain.
+  "healthy" traffic. Use `-U 30` for an internet-fed service on a lossy uplink: a transient
+  stall is then ridden out (the audio gap equals the stall) instead of killing the pipeline,
+  while systemd still restarts a genuinely dead decoder after 30 s.
 
 ### Media-clock PLL, emitter stalls and PTP steps (v1.7.0 – v1.7.2)
 
@@ -502,7 +504,8 @@ own once the upstream returns — no watchdog needed there.
   bursts seen with a free-running media clock.
 - **1.6.3** — `--raw` option **`-U/--underrun-exit N`**: exit after N seconds of buffer
   underrun so systemd restarts a pipeline whose decoder is still alive but no longer
-  delivering PCM. The Salland1 service uses `-U 10`.
+  delivering PCM. The Salland1 service uses `-U 30` (its uplink is a known lossy link; see
+  the note about blocking `input.http` in the paced-relay section).
 - **1.6.2** — PTP-step threshold lowered from 3 ms to **2 ms**, so a ~2.9 ms offset can no
   longer slip just under the detector and push the flow outside Dante's 2 ms budget.
 - **1.6.1** — automatic **PTP step detection and media-clock reseed** in both relay and

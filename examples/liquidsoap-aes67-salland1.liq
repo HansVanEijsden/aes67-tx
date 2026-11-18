@@ -11,8 +11,15 @@ s = mksafe(input.http("https://radio.salland1.nl/salland1-flac",
 
 # Raw 24-bit PCM on the child's stdin.  aes67-tx 1.6.0 does the PTP stamping
 # and the adaptive resampling; target 1.0 s, 3 s ring capacity.
+#
+# -U 30: the Salland1 uplink is a known lossy link (packet loss, reordering),
+# so a TCP stall can freeze input.http's blocking read for tens of seconds.
+# With -U 10 every such stall killed the pipeline (aes67-tx exits -> Liquidsoap
+# dies on the broken pipe -> systemd restart, ~17 s of silence per event).
+# -U 30 lets the chain ride out a stall of up to 30 s: the audio gap equals the
+# uplink stall instead of the stall plus a restart.
 output.external(
   %wav(header=false, samplerate=48000, channels=2, samplesize=24),
-  "/usr/local/bin/aes67-tx --raw -k 0x6a95A511 -a 239.69.100.2 -p 5004 -f eno1 -b 24 -C 2 -n 48 -J 3072 -L 1000 -U 10 -t 96 -l 8 -v",
+  "/usr/local/bin/aes67-tx --raw -k 0x6a95A511 -a 239.69.100.2 -p 5004 -f eno1 -b 24 -C 2 -n 48 -J 3072 -L 1000 -U 30 -t 96 -l 8 -v",
   s,
   self_sync=true)

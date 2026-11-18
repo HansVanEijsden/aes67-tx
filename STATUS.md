@@ -16,7 +16,7 @@ One Linux host acts as a PTP slave of the Dante/AES67 grandmaster and publishes 
 The Salland1 chain:
 
 - Liquidsoap fetches the lossless FLAC stream with `input.http` and writes raw 24-bit PCM via `output.external`.
-- `aes67-tx --raw` options in production: `-J 3072` (3 s ring capacity), `-L 1000` (1 s target), `-U 10` (exit after 10 s of underrun).
+- `aes67-tx --raw` options in production: `-J 3072` (3 s ring capacity), `-L 1000` (1 s target), `-U 30` (exit after 30 s of underrun — raised from 10 s on 2026-11-18 because the Salland1 uplink is a known lossy link; see below).
 - The service runs as root in a dedicated systemd unit because `aes67-tx` must open the PTP hardware clock and the multicast socket.
 - The existing `aes67-stream-watchdog` monitors packet presence; `-U 10` covers the separate case where the decoder stays alive but stops delivering PCM.
 
@@ -180,13 +180,27 @@ socket for the stream shows reordering/retransmits (`rcv_ooopack` 25, `reorderin
 the stream host is unreachable (fails within 1 ms; the chain connects over IPv4). Liquidsoap 2.4.6
 `input.http` is a blocking source, so a TCP stall freezes its clock and therefore the output.
 
-Candidate fixes (not applied yet): raise `-U 10` → `-U 30` so a transient stall no longer kills the
-pipeline; make the front-end non-blocking/buffered (Liquidsoap `timeout`/`on_error`, or an
-independent ffmpeg feeder with reconnect); investigate the upstream path (reordering since
-~15–16 Nov); and raise the journal retention.
+**Upstream context (confirmed by the operator, 2026-11-18):** the Salland1 FLAC stream is fed from
+the Salland1/Wijhe site over a link with **known packet loss**, by a Windows machine running
+**Butt** into the **Icecast server on the VPS**. A human listener (JRiver) on that stream also
+hears occasional hangs, skips and replays of an earlier passage — i.e. loss/reordering upstream,
+not an AES67 problem. That matches the journal: TCP reordering/retransmits on the stream socket,
+blocking `input.http`, pipeline stalls. No amount of buffering in `aes67-tx` can repair audio that
+the feed never delivered; the aim is only to lose as little air time as possible.
 
-**Journal retention is only ~3 days** (~490 MB, default settings): the two AES67 units write ~63k
-lines/day each because of `-v`, so post-mortems have a very short window.
+Applied 2026-11-18:
+
+- `-U 10` → **`-U 30`** in `/etc/liquidsoap/aes67-salland1/main.liq` (backup
+  `main.liq.bak-20261118`). A stall of up to 30 s is now ridden out (audio gap = uplink stall)
+  instead of killing the pipeline (+ ~7 s restart); a genuinely dead decoder is still restarted
+  by systemd after 30 s. Salland1 restarted at 11:53, `fill` 1002.8 ms, 0 underruns.
+- journald: `SystemMaxUse=2G` in `/etc/systemd/journald.conf` (backup
+  `journald.conf.bak-20261118`); at the current log volume that extends retention from ~3 days to
+  roughly 12 days. journald restarted, active.
+
+Still open: make the front-end non-blocking/buffered (Liquidsoap `timeout`/`on_error`, or an
+independent ffmpeg feeder with reconnect) so a TCP stall does not freeze the clock at all; and
+upstream (path/server) remains a known-loss link, outside this repository's control.
 
 ### 48-hour check on v1.7.3 (2026-11-09 13:38)
 
