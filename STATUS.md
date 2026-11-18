@@ -208,6 +208,15 @@ Applied 2026-11-18:
 - journald: `SystemMaxUse=2G` in `/etc/systemd/journald.conf` (backup
   `journald.conf.bak-20261118`); at the current log volume that extends retention from ~3 days to
   roughly 12 days. journald restarted, active.
+- **Stall reporting**: `tools/upstream-stall-report.sh`, installed on the host as
+  `/usr/local/bin/aes67-stall-report.sh`. It reads the per-second log and reports per day the
+  number of stall events, total inserted silence, longest stall, a duration histogram, how often
+  the buffer was below 1 s, and the restart/exit counts — the input for deciding whether `-L`
+  should be raised further.
+  First reading (last 3 days, old 1 s buffer): 71 events, 675 s inserted silence, **all events
+  5–10 s** (longest 10.0 s), 32.9 % of buffer samples below 1 s, 73 restarts. Since the buffer was
+  then 1 s, the real upstream stalls were ~6–11 s — i.e. the new 10 s target should absorb nearly
+  all of them.
 
 Validation of the buffer change (scratch group, synthetic `--raw` source): with the ring at
 ~10 s, stalling the producer for 5 s drained the buffer to ~8 s with **0 underruns** (no gap);
